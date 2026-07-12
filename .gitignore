@@ -1,0 +1,67 @@
+# OS/editor temporary files
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Archives / duplicated release packages
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+# Linux kernel module build outputs
+*.o
+*.ko
+*.mod
+*.mod.c
+*.symtypes
+*.order
+*.markers
+*.unsigned
+Module.symvers
+modules.order
+.tmp_versions/
+.cache.mk
+.*.cmd
+.*.d
+*.cmd
+
+# User-space app build outputs
+pango_pcie_dma_alloc/app_pcie/build/
+
+# Runtime logs and test output
+*.log
+transcript
+*.wlf
+*.vcd
+*.fst
+*.jou
+*.rpt
+*.tmp
+*.bak
+core
+core.*
+
+# FPGA / EDA generated outputs
+.last_generated
+**/generate_bitstream/
+**/compile/
+*.sbit
+*.smsk
+*.bgr
+*.bit
+*.bin
+*.mcs
+*.fs
+*.jed
+*.svf
+*.wf
+
+# Keep source, project, constraint, and documentation files tracked:
+#   *.c, *.h, Makefile, *.v, *.vhdl, *.svh, *.tcl, *.pds, *.idf, *.fdc, *.pcf, *.pdf, *.txt
