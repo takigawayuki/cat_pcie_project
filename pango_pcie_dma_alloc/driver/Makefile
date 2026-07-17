@@ -10,7 +10,7 @@ modules:
 modules_install:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules_install #必须以tab开头
 clean:
-	rm -rf *.o *~ core .depend .*.cmd *.ko *.mod *.mod.c .tmp_versions Module* modules* #必须以tab开头
+	rm -rf *.o *~ core .depend .*.cmd .*.d *.ko *.mod *.mod.c .tmp_versions Module* modules* #必须以tab开头
 .PHONY: modules modules_install clean
 else
  obj-m :=pango_pci_driver.o #空格开头

@@ -17,6 +17,7 @@
 #include <linux/delay.h>
 #include <linux/string.h>
 #include <linux/ctype.h>
+#include <linux/err.h>
 
 
 
@@ -241,7 +242,7 @@ void pci_driver_remove(struct pci_dev *dev);
 
 int init_pango_cdev(struct cdev *pango_cdev);
 int init_pango_pci_driver(struct pci_driver *pango_pci_driver);
-int init_pango_cdev_class(struct class *pango_cdev_class);
+int init_pango_cdev_class(void);
 
 void exit_pango_cdev(struct cdev *pango_cdev);
 void exit_pango_pci_driver(struct pci_driver *pango_pci_driver);

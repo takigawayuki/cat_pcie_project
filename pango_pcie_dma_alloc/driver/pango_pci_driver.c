@@ -291,8 +291,13 @@ static void ReadConfig(struct pci_dev * pdev)
 
 ssize_t pango_cdev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
 {
-	copy_to_user(buf, &command_operation, sizeof(COMMAND_OPERATION));
-	return 1;
+	if (count < sizeof(COMMAND_OPERATION))
+		return -EINVAL;
+
+	if (copy_to_user(buf, &command_operation, sizeof(COMMAND_OPERATION)))
+		return -EFAULT;
+
+	return sizeof(COMMAND_OPERATION);
 }
 
 ssize_t pango_cdev_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos)
@@ -349,29 +354,70 @@ long pango_cdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	unsigned char dest_buf[100];
 	unsigned int temp_data = 0;
 	unsigned int i = 0;
+	void *data_buf_r = NULL;
+	void *data_buf_w = NULL;
+	dma_addr_t dma_addr_r = 0;
+	dma_addr_t dma_addr_w = 0;
+	int ret = 0;
+
 	if(down_interruptible(&pci_pango->_sem))
 	{
 		printk(KERN_ALERT "********* pango_cdev_read interruptible *********\n");
 		return -ERESTARTSYS;
 	}
+
+	if(!op_dev)
+	{
+		ret = -ENODEV;
+		goto out;
+	}
+
 	switch(cmd)
 	{
-		case PCI_READ_DATA_CMD:	
-			copy_from_user(&config_operation,(COMMAND_OPERATION*)arg, sizeof(COMMAND_OPERATION));
+		case PCI_READ_DATA_CMD:
+			if (copy_from_user(&config_operation, (COMMAND_OPERATION __user *)arg, sizeof(COMMAND_OPERATION)))
+			{
+				ret = -EFAULT;
+				break;
+			}
 			pci_read_config_dword(op_dev, config_operation.addr, &config_operation.data);
-			copy_to_user((COMMAND_OPERATION*)arg, &config_operation, sizeof(COMMAND_OPERATION));
+			if (copy_to_user((COMMAND_OPERATION __user *)arg, &config_operation, sizeof(COMMAND_OPERATION)))
+				ret = -EFAULT;
 		break;
 		
-		case PCI_WRITE_DATA_CMD:	
-			copy_from_user(&config_operation,(COMMAND_OPERATION*)arg, sizeof(COMMAND_OPERATION));
+		case PCI_WRITE_DATA_CMD:
+			if (copy_from_user(&config_operation, (COMMAND_OPERATION __user *)arg, sizeof(COMMAND_OPERATION)))
+			{
+				ret = -EFAULT;
+				break;
+			}
 			pci_write_config_dword(op_dev, config_operation.addr, config_operation.data);
 		break;
 		
 		case PCI_MAP_ADDR_CMD:
+			if (copy_from_user(&dma_operation, (DMA_OPERATION __user *)arg, sizeof(DMA_OPERATION)))
+			{
+				ret = -EFAULT;
+				break;
+			}
+
+			data_buf_r = pci_alloc_consistent(op_dev, dma_operation.current_len*4, &dma_addr_r);
+			data_buf_w = pci_alloc_consistent(op_dev, dma_operation.current_len*4, &dma_addr_w);
+			if (!data_buf_r || !data_buf_w)
+			{
+				if (data_buf_r)
+					pci_free_consistent(op_dev, dma_operation.current_len*4, data_buf_r, dma_addr_r);
+				if (data_buf_w)
+					pci_free_consistent(op_dev, dma_operation.current_len*4, data_buf_w, dma_addr_w);
+				ret = -ENOMEM;
+				break;
+			}
+
 			spin_lock(&dma_info.addr_r.lock);
-			copy_from_user(&dma_operation,(DMA_OPERATION*)arg, sizeof(DMA_OPERATION));
-			dma_info.addr_r.data_buf = pci_alloc_consistent(op_dev, dma_operation.current_len*4, &dma_info.addr_r.addr);
-			dma_info.addr_w.data_buf = pci_alloc_consistent(op_dev, dma_operation.current_len*4, &dma_info.addr_w.addr);
+			dma_info.addr_r.data_buf = data_buf_r;
+			dma_info.addr_w.data_buf = data_buf_w;
+			dma_info.addr_r.addr = dma_addr_r;
+			dma_info.addr_w.addr = dma_addr_w;
 			dma_info.addr_r.addr_size = ((dma_info.addr_r.addr >> 32) > 0) ? 1 : 0;
 			dma_info.addr_w.addr_size = ((dma_info.addr_w.addr >> 32) > 0) ? 1 : 0;
 			dma_info.cmd.data.length = dma_operation.current_len - 1;
@@ -384,9 +430,13 @@ long pango_cdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			spin_unlock(&dma_info.addr_r.lock);
 		break;
 		
-		case PCI_WRITE_TO_KERNEL_CMD:										
+		case PCI_WRITE_TO_KERNEL_CMD:
+			if (copy_from_user(&dma_operation, (DMA_OPERATION __user *)arg, sizeof(DMA_OPERATION)))
+			{
+				ret = -EFAULT;
+				break;
+			}
 			spin_lock(&dma_info.addr_r.lock);
-			copy_from_user(&dma_operation,(DMA_OPERATION*)arg, sizeof(DMA_OPERATION));
 			memcpy(dma_info.addr_r.data_buf, dma_operation.data.write_buf, dma_operation.current_len*4);
 			memset(dma_info.addr_w.data_buf, 0, dma_operation.current_len*4);
 			spin_unlock(&dma_info.addr_r.lock);
@@ -412,23 +462,37 @@ long pango_cdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		case PCI_READ_FROM_KERNEL_CMD:										/* 将数据写入CPU缓存 */
 			spin_lock(&dma_info.addr_r.lock);
 			memcpy(dma_operation.data.read_buf, dma_info.addr_w.data_buf, dma_operation.current_len*4);
-			copy_to_user((DMA_OPERATION*)arg, &dma_operation, sizeof(DMA_OPERATION));
 			spin_unlock(&dma_info.addr_r.lock);
+			if (copy_to_user((DMA_OPERATION __user *)arg, &dma_operation, sizeof(DMA_OPERATION)))
+				ret = -EFAULT;
 		break;
 		
 		case PCI_UMAP_ADDR_CMD:
 			spin_lock(&dma_info.addr_r.lock);
-			pci_free_consistent(op_dev, dma_operation.current_len*4, dma_info.addr_r.data_buf, dma_info.addr_r.addr);
-			pci_free_consistent(op_dev, dma_operation.current_len*4, dma_info.addr_w.data_buf, dma_info.addr_w.addr);
+			pci_free_consistent(op_dev, dma_operation.current_len*4, dma_info.addr_r.data_buf, dma_info.addr_r.addr - dma_operation.offset_addr);
+			pci_free_consistent(op_dev, dma_operation.current_len*4, dma_info.addr_w.data_buf, dma_info.addr_w.addr - dma_operation.offset_addr);
 			dma_info.addr_r.data_buf = NULL;
 			dma_info.addr_w.data_buf = NULL;
 			spin_unlock(&dma_info.addr_r.lock);
 		break;
 
 		case PCI_PERFORMANCE_START_CMD:
+			if (copy_from_user(&performance_operation, (PERFORMANCE_OPERATION __user *)arg, sizeof(PERFORMANCE_OPERATION)))
+			{
+				ret = -EFAULT;
+				break;
+			}
+
+			data_buf_r = pci_alloc_consistent(op_dev, DMA_MAX_PACKET_SIZE*10*2, &dma_addr_r);
+			if (!data_buf_r)
+			{
+				ret = -ENOMEM;
+				break;
+			}
+
 			spin_lock(&performance_config.addr.lock);
-			copy_from_user(&performance_operation,(PERFORMANCE_OPERATION*)arg, sizeof(PERFORMANCE_OPERATION));
-			performance_config.addr.data_buf = pci_alloc_consistent(op_dev, DMA_MAX_PACKET_SIZE*10*2, &performance_config.addr.addr);
+			performance_config.addr.data_buf = data_buf_r;
+			performance_config.addr.addr = dma_addr_r;
 			for(i = 0; i < (DMA_MAX_PACKET_SIZE*10)/16; i++)
 			{
 				memset(dest_buf, 0, sizeof(dest_buf));
@@ -461,15 +525,26 @@ long pango_cdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			{
 				performance_operation.cmp_flag = 0;
 			}
-			copy_to_user((PERFORMANCE_OPERATION*)arg, &performance_operation, sizeof(PERFORMANCE_OPERATION));
+			spin_unlock(&performance_config.addr.lock);
+			if (copy_to_user((PERFORMANCE_OPERATION __user *)arg, &performance_operation, sizeof(PERFORMANCE_OPERATION)))
+			{
+				ret = -EFAULT;
+				break;
+			}
+			spin_lock(&performance_config.addr.lock);
 			pci_free_consistent(op_dev, DMA_MAX_PACKET_SIZE*10*2, performance_config.addr.data_buf, performance_config.addr.addr);
 			performance_config.addr.data_buf = NULL;
 			spin_unlock(&performance_config.addr.lock);
 		break;
+
+		default:
+			ret = -ENOTTY;
+		break;
 	}
 	
+out:
 	up (&pci_pango->_sem);
-    return 0;
+    return ret;
 }
 
 
@@ -497,14 +572,14 @@ static int set_dma_mask(struct pci_dev *pdev)
     LOG("sizeof(dma_addr_t) == %ld\n", sizeof(dma_addr_t));
 
     /* 64-bit addressing capability for XDMA? */
-    if (!pci_set_dma_mask(pdev, DMA_BIT_MASK(64))) {
+    if (!dma_set_mask(&pdev->dev, DMA_BIT_MASK(64))) {
         /* query for DMA transfer */
         /* @see Documentation/DMA-mapping.txt */
         LOG("pci_set_dma_mask()\n");
         /* use 64-bit DMA */
         LOG("Using a 64-bit DMA mask.\n");
         /* use 32-bit DMA for descriptors */
-        pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(64));
+        dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(64));
         /* use 64-bit DMA, 32-bit for consistent */
     } else if (!pci_set_dma_mask(pdev, DMA_BIT_MASK(32))) {
         LOG("Could not set 64-bit DMA mask.\n");
@@ -675,38 +750,49 @@ void exit_pango_pci_driver(struct pci_driver *pango_pci_driver)
 }
 
 // class_create动态创建设备的逻辑类，并完成部分字段的初始化，然后将其添加到内核中。创建的逻辑类位于/sys/class/。
-int init_pango_cdev_class(struct class *pango_cdev_class)
+int init_pango_cdev_class(void)
 {
-	int result = -1;
+	struct device *dev_ret;
+	int result = 0;
 	
 	LOG("init_pango_cdev_class.\n");
 	
-	pango_cdev_class = class_create(THIS_MODULE, pci_dev_info._dev_name);
-	
-#ifndef NDEBUG
-	(!!pango_cdev_class) ? LOG("class create success.\n") : LOG("class create failed.\n");
-#endif
-	
-	if(pango_cdev_class)
+	pci_info._cdev_class = class_create(THIS_MODULE, pci_dev_info._dev_name);
+	if(IS_ERR(pci_info._cdev_class))
 	{
-		LOG("create device.\n");
-		device_create(pango_cdev_class, NULL, pci_dev_info._dev, NULL, "%s", pci_dev_info._dev_name);
-		
-		result = 0;
+		result = PTR_ERR(pci_info._cdev_class);
+		pci_info._cdev_class = NULL;
+		LOG("class create failed, result : %d\n", result);
+		return result;
+	}
+
+	LOG("class create success.\n");
+	LOG("create device.\n");
+	dev_ret = device_create(pci_info._cdev_class, NULL, pci_dev_info._dev, NULL, "%s", pci_dev_info._dev_name);
+	if(IS_ERR(dev_ret))
+	{
+		result = PTR_ERR(dev_ret);
+		class_destroy(pci_info._cdev_class);
+		pci_info._cdev_class = NULL;
+		LOG("device create failed, result : %d\n", result);
+		return result;
 	}
 	
-	return result;
+	return 0;
 }
 
 void exit_pango_cdev_class(struct class *pango_cdev_class)
 {
+	if(!pango_cdev_class)
+		return;
+
 	LOG("device_destroy\n");
 	device_destroy(pango_cdev_class, pci_dev_info._dev);
 	
 	LOG("class_destroy\n");
 	class_destroy(pango_cdev_class);
 	
-	pango_cdev_class = NULL;
+	pci_info._cdev_class = NULL;
 	
 	LOG("exit cdev class.\n");
 }
@@ -718,6 +804,12 @@ int __init init_pci_pango(void)
 	int result = 0;
 	
 	LOG("init_pci_pango.\n");
+
+	sema_init(&pci_info._sem, 1);
+	spin_lock_init(&dma_info.addr_r.lock);
+	spin_lock_init(&dma_info.addr_w.lock);
+	spin_lock_init(&performance_config.addr.lock);
+	LOG("lock init.\n");
 	
 	result = init_pango_cdev(&pci_info._cdev);						//申请主设备号
 	LOG("init cdev result : %d\n", result);
@@ -725,10 +817,7 @@ int __init init_pci_pango(void)
 	result = init_pango_pci_driver(&pci_info._pango_pci_driver._pci_driver);
 	LOG("init pci result : %d\n", result);
 	
-	sema_init(&pci_info._sem, 1);
-	LOG("sema_init.\n");
-	
-	result = init_pango_cdev_class(pci_info._cdev_class);
+	result = init_pango_cdev_class();
 	LOG("init cdev class result : %d\n", result);
 	
 	return result;

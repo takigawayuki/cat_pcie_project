@@ -15,6 +15,10 @@ Thumbs.db
 *.rar
 *.7z
 
+# Large local packages copied beside the project
+pcie_test_platform_v1_0.zip
+PCIE_DMA_test_color_MES50HP_X1/
+
 # Linux kernel module build outputs
 *.o
 *.ko
@@ -52,8 +56,24 @@ core.*
 .last_generated
 **/generate_bitstream/
 **/compile/
+**/constraint_check/
+**/device_map/
+**/generate_netlist/
+**/place_route/
+**/report_power/
+**/report_timing/
+**/synthesize/
+**/log/
+**/logbackup/
+**/ip_backup/
+**/sim_lib/
+**/bak/
+**/backup/
+**/sim/modelsim/
+**/sim/modelsim/work/
 *.sbit
 *.smsk
+*.sfc
 *.bgr
 *.bit
 *.bin
@@ -62,6 +82,24 @@ core.*
 *.jed
 *.svf
 *.wf
+*.wdf
+*.qpg
+*.db
+*.adf
+*.dmr
+*.cmr
+*.snr
+*.prr
+*.rtr
+*.sdf
+*.vm
+*.netlist
+*.pvf
+*.ccr
+*.dprj
+*.lock
+rdfile_*
+cfg_verify_result.*
 
 # Keep source, project, constraint, and documentation files tracked:
 #   *.c, *.h, Makefile, *.v, *.vhdl, *.svh, *.tcl, *.pds, *.idf, *.fdc, *.pcf, *.pdf, *.txt
