@@ -1,0 +1,5 @@
+build/
+*.rgb565
+*.raw
+*.ppm
+*.png
