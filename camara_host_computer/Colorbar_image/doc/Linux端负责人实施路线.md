@@ -2022,3 +2022,463 @@ allow_dma_start=1
 PDF 能帮我们理解 BAR、配置空间和 PIO Test；
 但最终确认控制 BAR，仍然要看 FPGA 是否收到 0x130 STOP 并触发 dma_stop_flag。
 ```
+
+
+## 2026-7-19 当前安全调试记录
+
+本节记录 2026-7-19 当前已经实际跑过的命令、看到的结果、判断结论、以及下一步只允许做的安全调试。后续调试继续按这种日期标题往下追加。
+
+### 1. 已跑命令：PCIe 枚举和 BAR 信息
+
+执行：
+
+```sh
+lspci -nn
+```
+
+输出中能看到：
+
+```text
+00:00.0 PCI bridge [0604]: Fuzhou Rockchip Electronics Co., Ltd Device [1d87:3566]
+01:00.0 Memory controller [0580]: Device [0755:0755]
+```
+
+说明：
+
+```text
+PCIe Endpoint 已经被 RK3568 Linux 枚举到。
+FPGA 设备 Vendor:Device = 0755:0755。
+这说明当前不是“完全没有链路”的问题。
+```
+
+执行：
+
+```sh
+lspci -vv -s 01:00.0
+cat /sys/bus/pci/devices/0000:01:00.0/resource
+```
+
+当前 BAR 信息：
+
+```text
+BAR0: 0xf4200000 - 0xf4201fff，大小 8KB
+BAR1: 0xf4204000 - 0xf4204fff，大小 4KB
+BAR2: 0xf4202000 - 0xf4203fff，大小 8KB，64-bit
+```
+
+链路信息：
+
+```text
+Link Speed: 2.5GT/s
+Link Width: x1
+```
+
+说明：
+
+```text
+Linux 侧 PCIe 枚举和 BAR 分配正常。
+BAR1 是 4KB，更像控制寄存器空间。
+当前 Linux 驱动优先使用 bar=1 是合理的，但还不能只靠 lspci 证明 FPGA 的 pcie_dma_ctrl 一定接在 BAR1。
+```
+
+### 2. 已跑命令：安全模式加载驱动
+
+执行安全模式加载：
+
+```sh
+sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 frame_wait_ms=100
+```
+
+随后检查：
+
+```sh
+ls -l /dev/colorbar_pcie_rx
+dmesg | tail -n 120
+```
+
+当前看到：
+
+```text
+/dev/colorbar_pcie_rx 已创建
+colorbar_pcie_rx 0000:01:00.0: sent DMA STOP + cleared dma_addr0..3 on BAR1
+colorbar_pcie_rx 0000:01:00.0: colorbar PCIe RX probe ok, BAR1 len=0x1000
+colorbar PCIe RX driver loaded
+```
+
+说明：
+
+```text
+Linux 驱动已经成功绑定 0755:0755。
+当前使用 BAR1。
+驱动 probe 阶段已经执行 safe-stop：写 0x130 STOP，并连续 4 次写 0 到 0x110。
+```
+
+注意：这只能说明 Linux 驱动侧已经执行写操作，还不能单独证明 FPGA 端已经收到。是否收到必须看 FPGA ILA/SignalTap。
+
+### 3. 已跑命令：手动 safe-stop
+
+执行：
+
+```sh
+sudo ./build/pcie_color_rx --safe-stop
+dmesg | tail -n 100
+```
+
+用户态输出：
+
+```text
+sent safe stop to /dev/colorbar_pcie_rx
+```
+
+内核日志新增：
+
+```text
+colorbar_pcie_rx 0000:01:00.0: sent DMA STOP + cleared dma_addr0..3 on BAR1
+```
+
+说明：
+
+```text
+--safe-stop ioctl 路径正常。
+Linux 驱动再次向 BAR1 + 0x130 写 STOP，并向 BAR1 + 0x110 连续写 4 次 0。
+```
+
+这一步的意义：
+
+```text
+给 FPGA 端提供一次明确的触发点，方便抓 cmd_reg_addr=0x130 和 dma_stop_flag。
+这一步不会给 FPGA 写非零 DMA 地址，不会主动启动图像 DMA。
+```
+
+### 4. 已跑命令：尝试采一帧但被安全闸门拒绝
+
+执行：
+
+```sh
+sudo ./build/pcie_color_rx --once --output /tmp/frame_test.rgb565
+```
+
+实际输出：
+
+```text
+COLORBAR_IOC_START: Operation not permitted
+```
+
+这是预期正确结果。
+
+说明：
+
+```text
+当前没有加 allow_dma_start=1。
+驱动拒绝 COLORBAR_IOC_START。
+Linux 没有向 FPGA 写新的非零 DMA 地址。
+不会真正启动 FPGA DMA。
+```
+
+这一条不是错误，而是当前代码故意设置的保护结果。它说明上次导致系统崩溃的“直接启动 DMA”路径现在已经被挡住。
+
+### 5. 当前结论
+
+当前 Linux 侧安全检查结果：
+
+```text
+[x] PCIe Endpoint 0755:0755 已枚举
+[x] BAR0/BAR1/BAR2 信息已读取
+[x] 当前优先测试 BAR1
+[x] colorbar_pcie_driver 能加载
+[x] /dev/colorbar_pcie_rx 能创建
+[x] probe 阶段 safe-stop 已执行
+[x] 用户态 --safe-stop 已执行
+[x] allow_dma_start=0 时 --once 被拒绝
+[x] Linux 侧没有真正启动 DMA
+```
+
+当前判断：
+
+```text
+RK3568 Linux 侧目前能正常枚举 FPGA，也能加载驱动。
+现在的关键问题不是 link up，也不是驱动是否能绑定。
+真正还没确认的是：Linux 写 BAR1 + 0x130 STOP 时，FPGA 的 pcie_dma_ctrl 是否真的收到。
+```
+
+### 6. 当前还没有确认的内容
+
+下面这些还没有通过 Linux 输出单独确认，必须 FPGA 端配合看信号：
+
+```text
+[ ] Linux 写 BAR1 + 0x130 时，FPGA 是否看到 cmd_reg_addr = 0x130
+[ ] FPGA 的 dma_stop_flag 是否跳变
+[ ] safe-stop 后 dma_addr0 是否为 0
+[ ] safe-stop 后 dma_addr1 是否为 0
+[ ] safe-stop 后 dma_addr2 是否为 0
+[ ] safe-stop 后 dma_addr3 是否为 0
+[ ] rc_cfg_ep_flag 是否为 0
+[ ] dma_start 是否为 0
+[ ] 不加 allow_dma_start=1 执行 --once 时，FPGA 是否没有 MWR 发出
+```
+
+### 7. 下一步只做 FPGA 端确认
+
+下一步不要继续加 `allow_dma_start=1`，也不要真正采图。
+
+请 FPGA 端用 ILA/SignalTap 抓这些信号：
+
+```text
+bar_hit
+o_bar1_wr_en
+axis_master_tvalid
+axis_master_tdata
+cmd_reg_addr
+dma_stop_flag
+dma_addr0
+dma_addr1
+dma_addr2
+dma_addr3
+rc_cfg_ep_flag
+fram_start
+dma_start
+dma_cnt
+```
+
+Linux 侧为了给 FPGA 抓波形，可以重复执行：
+
+```sh
+sudo ./build/pcie_color_rx --safe-stop
+dmesg | tail -n 50
+```
+
+FPGA 端预期看到：
+
+```text
+cmd_reg_addr = 0x130
+dma_stop_flag 跳变
+dma_addr0..3 全部为 0
+rc_cfg_ep_flag = 0
+dma_start = 0
+```
+
+如果 FPGA 端确认以上现象成立：
+
+```text
+BAR1 的 STOP/清地址链路基本确认正确。
+可以进入下一阶段：地址字节序验证。
+```
+
+如果 FPGA 端没有看到 `0x130` 或 `dma_stop_flag` 不跳：
+
+```text
+说明 bar=1 可能没有进 pcie_dma_ctrl。
+需要在 FPGA 重新上电或重新加载 bitstream 后，安全测试 bar=0。
+仍然不能加 allow_dma_start=1。
+```
+
+### 8. 当前禁止事项
+
+在 FPGA 端确认 BAR1 的 STOP 链路之前，禁止执行：
+
+```sh
+sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 allow_dma_start=1 frame_wait_ms=100
+sudo ./build/pcie_color_rx --once --output /tmp/frame_0000.rgb565
+```
+
+当前一句话：
+
+```text
+2026-7-19 当前 Linux 侧安全闸门已经验证有效；下一步必须让 FPGA 端确认 BAR1 + 0x130 是否真的触发 dma_stop_flag。
+```
+
+### 9. 当前需要运行的命令
+
+当前只运行下面这些命令，不进入真实 DMA 采图。
+
+如果驱动还没加载：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 frame_wait_ms=100
+ls -l /dev/colorbar_pcie_rx
+dmesg | tail -n 80
+```
+
+确认设备和 BAR：
+
+```sh
+lspci -nn
+lspci -vv -s 01:00.0
+cat /sys/bus/pci/devices/0000:01:00.0/resource
+```
+
+给 FPGA 抓波形用的安全触发命令：
+
+```sh
+sudo ./build/pcie_color_rx --safe-stop
+dmesg | tail -n 50
+```
+
+确认安全闸门仍然生效：
+
+```sh
+sudo ./build/pcie_color_rx --once --output /tmp/frame_test.rgb565
+```
+
+这一条当前应该输出：
+
+```text
+COLORBAR_IOC_START: Operation not permitted
+```
+
+如果输出这个，表示仍然没有真正启动 DMA，是安全状态。
+
+当前不要运行：
+
+```sh
+sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 allow_dma_start=1 frame_wait_ms=100
+sudo ./build/pcie_color_rx --once --output /tmp/frame_0000.rgb565
+```
+
+## 2026-7-19 FPGA 端不好确认时的安全推进策略
+
+### 1. 先回答结论
+
+如果 FPGA 端暂时不好用 ILA/SignalTap 确认 BAR 和 STOP，那么不建议直接进入完整 DMA 采图。
+
+可以继续推进，但下一步应该是“受控风险测试”，不是默认认为已经安全。
+
+原因是：
+
+```text
+PCIe Endpoint 一旦作为 Bus Master 发起 DMA，它可以主动写 RK3568 主机内存。
+如果 BAR 选错、DMA 地址字节序错、FPGA 内部旧地址没有清掉，Linux 侧可能被写坏内存，表现为系统卡死、桌面进不去、文件系统异常。
+```
+
+这类问题主要是软件/协议/地址配置风险，一般不是板子生命健康风险。正常电源、电平、转接线没有问题的情况下，它更容易伤的是 Linux 当前运行环境和文件系统，不是直接把 FPGA 或鲁班猫硬件打坏。
+
+### 2. 当前已经做的 Linux 侧加固
+
+2026-7-19 已对 `camara_host_computer/Colorbar_image/driver/colorbar_pcie_driver.c` 做了额外安全收紧：
+
+```text
+1. 驱动 probe 阶段不再一直打开 PCI Bus Master。
+2. probe 阶段只做 safe-stop 和清 dma_addr0..3。
+3. 真正 COLORBAR_IOC_START 时才临时 pci_set_master()。
+4. COLORBAR_IOC_STOP、COLORBAR_IOC_FREE_BUFS、驱动 remove 时都会 pci_clear_master()。
+5. allow_dma_start 默认仍然是 0，不显式打开就不会写非零 DMA 地址。
+```
+
+这次修改后的意义：
+
+```text
+加载驱动本身不会让 FPGA 长时间具备主动 DMA 写主机内存的能力。
+即使后面做一次受控 DMA 测试，测试结束后也会尽快关闭 Bus Master。
+```
+
+但注意：
+
+```text
+这不是 100% 隔离。
+只要 allow_dma_start=1 并执行 --once，就仍然存在 FPGA 写错主机内存的风险。
+```
+
+### 3. 现在可以安全做的下一步
+
+先只验证新版驱动加载后 BusMaster 默认关闭。
+
+执行：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 frame_wait_ms=100
+lspci -vv -s 01:00.0 | grep -E "Control:|Region|LnkSta"
+dmesg | tail -n 80
+```
+
+预期重点看：
+
+```text
+Control: ... BusMaster- ...
+colorbar PCIe RX probe ok, BAR1 len=0x1000, BusMaster disabled until START
+```
+
+如果看到 `BusMaster-`，说明驱动加载后没有给 FPGA 长期开 DMA 主动写权限。
+
+然后继续跑安全停止：
+
+```sh
+sudo ./build/pcie_color_rx --safe-stop
+dmesg | tail -n 50
+```
+
+预期看到：
+
+```text
+sent safe stop to /dev/colorbar_pcie_rx
+colorbar_pcie_rx 0000:01:00.0: sent DMA STOP + cleared dma_addr0..3 on BAR1
+```
+
+再确认安全闸门：
+
+```sh
+sudo ./build/pcie_color_rx --once --output /tmp/frame_test.rgb565
+```
+
+当前仍然应该输出：
+
+```text
+COLORBAR_IOC_START: Operation not permitted
+```
+
+这一步还是安全路径，不会真正启动 DMA。
+
+### 4. 如果一定要在 FPGA 端无法确认的情况下试一帧
+
+这一步有风险，只能作为“受控风险测试”。建议满足这些条件后再做：
+
+```text
+[ ] 使用可重刷/可恢复的系统卡或已经备份好系统镜像
+[ ] 不在 eMMC/SD 卡上保存关键文件
+[ ] 输出文件写到 /tmp
+[ ] 当前 lspci 能看到 BusMaster-
+[ ] safe-stop 命令执行正常
+[ ] 不循环采集，只采一帧
+[ ] 采完立刻卸载驱动或 safe-stop
+```
+
+受控一帧测试命令：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 allow_dma_start=1 frame_wait_ms=100
+sudo ./build/pcie_color_rx --once --output /tmp/frame_test.rgb565
+sudo ./build/pcie_color_rx --safe-stop
+sudo rmmod colorbar_pcie_driver
+```
+
+如果这一步再次导致系统异常，优先怀疑：
+
+```text
+1. BAR1 并不是 pcie_dma_ctrl 实际接收 0x110/0x130 的 BAR。
+2. addr_byteswap=1 与 FPGA 实际解析不匹配。
+3. FPGA 写入长度/地址递增方式和 Linux 分配的 buffer 不匹配。
+4. FPGA 没有正确响应 STOP，导致持续 DMA。
+5. FPGA 的 MWR 目标地址不是 Linux 打印出来的 coherent DMA 地址。
+```
+
+### 5. 当前建议
+
+当前最稳的顺序是：
+
+```text
+第一步：先加载新版驱动，确认 lspci 里 BusMaster-。
+第二步：继续只跑 --safe-stop 和 Operation not permitted 测试。
+第三步：如果必须推进，再用备份系统卡做一次 allow_dma_start=1 的单帧测试。
+第四步：不要循环测试，不要长时间开着驱动不卸载。
+```
+
+一句话：
+
+```text
+可以开始下一步，但下一步应先验证 BusMaster 默认关闭；真正 allow_dma_start=1 只能作为有备份前提下的一次性受控测试，不能当作已经完全安全。
+```
+

@@ -154,6 +154,9 @@ static int colorbar_start_locked(struct colorbar_device *cdev)
 		return -EPERM;
 	}
 
+	/* Keep Bus Master disabled while programming DMA addresses. */
+	pci_clear_master(cdev->pdev);
+
 	for (i = 0; i < COLORBAR_BUFFER_COUNT; i++)
 		memset(cdev->bufs[i].cpu_addr, 0, COLORBAR_BUFFER_SIZE);
 
@@ -161,17 +164,21 @@ static int colorbar_start_locked(struct colorbar_device *cdev)
 		colorbar_write_dma_addr(cdev, cdev->bufs[i].dma_addr);
 
 	wmb();
+	pci_set_master(cdev->pdev);
+	wmb();
 	cdev->started = true;
 	cdev->frame_counter = 0;
 
 	dev_info(&cdev->pdev->dev,
-		 "started colorbar RX, addr_byteswap=%d, allow_dma_start=%d, wait_ms=%u\n",
+		 "started colorbar RX, addr_byteswap=%d, allow_dma_start=%d, wait_ms=%u, BusMaster enabled only for capture window\n",
 		 addr_byteswap, allow_dma_start, frame_wait_ms);
 	return 0;
 }
 
 static void colorbar_stop_locked(struct colorbar_device *cdev)
 {
+	/* Block further PCIe Memory Writes first; MMIO STOP does not require Bus Master. */
+	pci_clear_master(cdev->pdev);
 	colorbar_hw_safe_stop(cdev);
 }
 
@@ -352,18 +359,18 @@ static int colorbar_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	}
 
 	/*
-	 * 安全保护：先不要打开 Bus Master。
+	 * 安全保护：驱动加载阶段保持 Bus Master 关闭。
 	 * pci_enable_device_mem() 允许主机 MMIO 写 BAR，但不需要 FPGA
-	 * 具备主动 DMA 能力。先 STOP/清旧地址，再 pci_set_master()，
-	 * 避免 FPGA 在 probe 窗口期用旧 dma_addr 自动 MWR。
+	 * 具备主动 DMA 能力。probe 只做 STOP/清旧地址，真正 START
+	 * 时才短暂打开 Bus Master，降低错误 DMA 持续写内存的风险。
 	 */
+	pci_clear_master(pdev);
 	colorbar_hw_safe_stop(cdev);
-	pci_set_master(pdev);
 
 	pci_set_drvdata(pdev, cdev);
 	g_cdev = cdev;
 
-	dev_info(&pdev->dev, "colorbar PCIe RX probe ok, BAR%d len=0x%pa\n",
+	dev_info(&pdev->dev, "colorbar PCIe RX probe ok, BAR%d len=0x%pa, BusMaster disabled until START\n",
 		 bar, &cdev->bar_len);
 	return 0;
 
