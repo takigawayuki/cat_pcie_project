@@ -501,6 +501,33 @@ dmesg 里能看到 START written=0x01000000
 
 64B 是第一条真实 DMA 测试，有风险，但风险被限制在最小长度。若这一步异常，不能继续测试 4KB 或全帧。
 
+64B 如果读出来全是 `00`，不要马上判断成功。旧版本驱动会在 START 前把 DMA buffer 清 0，因此“全 00”可能有两种情况：
+
+```text
+FPGA 真的写入了 0 数据
+FPGA 没有写入，Linux 读到的是驱动预清零内容
+```
+
+当前驱动已经改为 START 前用 `0xA5` 预填充 DMA buffer。重新编译并重复 64B 后，判断方式如下：
+
+```text
+如果 /tmp/frame_64.bin 仍然全是 a5，说明 FPGA 大概率没有写入 host buffer。
+如果 /tmp/frame_64.bin 变成 00 或其他规律数据，说明 FPGA 至少发生了写入。
+如果系统不崩溃但数据全 a5，下一步查 FPGA 的 host_start_flag、pcie_dma_enable、AXIS_S_TVALID/TREADY/TLAST。
+```
+
+重复 64B 的命令：
+
+```sh
+make clean
+make
+./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=64
+sudo ./build/pcie_color_rx --once --output /tmp/frame_64_prefill.bin
+ls -lh /tmp/frame_64_prefill.bin
+hexdump -C /tmp/frame_64_prefill.bin | head
+sudo dmesg | tail -n 120
+```
+
 ### 7. 4KB 真实 DMA 测试
 
 只有 64B 稳定后才执行。

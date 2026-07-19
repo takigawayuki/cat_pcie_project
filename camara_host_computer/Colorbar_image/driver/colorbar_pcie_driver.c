@@ -14,6 +14,8 @@
 
 #include "colorbar_pcie_driver.h"
 
+#define COLORBAR_DMA_PREFILL_PATTERN 0xA5
+
 struct colorbar_dma_buffer {
 	void *cpu_addr;
 	dma_addr_t dma_addr;
@@ -160,7 +162,7 @@ static int colorbar_alloc_buffers_locked(struct colorbar_device *cdev)
 			goto fail;
 		}
 
-		memset(cdev->bufs[i].cpu_addr, 0, buffer_size);
+		memset(cdev->bufs[i].cpu_addr, COLORBAR_DMA_PREFILL_PATTERN, buffer_size);
 		dev_info(&cdev->pdev->dev, "buffer%d cpu=%p dma=%pad size=%zu requested_len=%u\n",
 			 i, cdev->bufs[i].cpu_addr, &cdev->bufs[i].dma_addr,
 			 buffer_size, dma_len_bytes);
@@ -259,7 +261,7 @@ static int colorbar_start_locked(struct colorbar_device *cdev)
 	colorbar_hw_safe_stop(cdev);
 
 	for (i = 0; i < COLORBAR_BUFFER_COUNT; i++)
-		memset(cdev->bufs[i].cpu_addr, 0, cdev->buffer_size);
+		memset(cdev->bufs[i].cpu_addr, COLORBAR_DMA_PREFILL_PATTERN, cdev->buffer_size);
 
 	colorbar_write_cmd32(cdev, COLORBAR_DMA_ARM_MAGIC, COLORBAR_REG_DMA_ARM);
 	colorbar_write_cmd32(cdev, dma_len_bytes, COLORBAR_REG_DMA_LEN);
