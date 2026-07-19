@@ -2600,3 +2600,131 @@ sudo rmmod colorbar_pcie_driver
 
 如果没有备份系统卡，当前不建议执行上面这组 `allow_dma_start=1` 命令。
 
+## 2026-7-19 safe-stop 与安全闸门复测结果
+
+### 1. 本次实际执行结果
+
+执行：
+
+```sh
+sudo ./build/pcie_color_rx --safe-stop
+```
+
+输出：
+
+```text
+sent safe stop to /dev/colorbar_pcie_rx
+```
+
+执行：
+
+```sh
+sudo ./build/pcie_color_rx --once --output /tmp/frame_test.rgb565
+```
+
+输出：
+
+```text
+COLORBAR_IOC_START: Operation not permitted
+```
+
+### 2. 本次结论
+
+这两个结果都是预期结果：
+
+```text
+[x] 用户态可以正常打开 /dev/colorbar_pcie_rx
+[x] COLORBAR_IOC_SAFE_STOP ioctl 正常
+[x] 当前驱动仍然默认禁止 START
+[x] 没有 allow_dma_start=1 时，--once 不会写非零 DMA 地址
+[x] 当前仍然没有真正启动 FPGA DMA
+```
+
+所以当前 Linux 侧已经完成这些前置安全检查：
+
+```text
+1. PCIe Link Up 已确认
+2. BAR 分配已确认
+3. 驱动绑定已确认
+4. 驱动加载后 BusMaster- 已确认
+5. safe-stop 用户态路径已确认
+6. allow_dma_start=0 安全闸门已确认
+```
+
+### 3. 本次新增的进一步保护
+
+因为 FPGA 端暂时不好确认 STOP/BAR 信号，2026-7-19 又对驱动增加了一层保护：
+
+```text
+COLORBAR_IOC_WAIT_FRAME 等待 frame_wait_ms 后，会立刻执行 colorbar_stop_locked()。
+colorbar_stop_locked() 会先 pci_clear_master()，再向 FPGA 写 STOP 和清 dma_addr0..3。
+```
+
+也就是说，后续如果做一次性真实 DMA，流程会变成：
+
+```text
+START：写 DMA 地址，然后临时打开 Bus Master
+WAIT_FRAME：等待 frame_wait_ms
+WAIT_FRAME 返回前：驱动自动关闭 Bus Master，并发送 safe-stop
+用户态：再保存 /tmp/frame_test.rgb565
+```
+
+这比之前更安全，因为 DMA 窗口不会一直持续到用户态写文件和校验结束。
+
+### 4. 当前下一步选择
+
+当前有两个选择。
+
+保守选择：继续停在安全验证阶段，不做真实 DMA。
+
+```sh
+sudo ./build/pcie_color_rx --safe-stop
+dmesg | tail -n 50
+lspci -vv -s 01:00.0 | grep -E "Control:|LnkSta"
+```
+
+推进选择：在已经备份系统卡、能接受异常后重刷的前提下，做一次受控 DMA 采图。
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 allow_dma_start=1 frame_wait_ms=50
+sudo ./build/pcie_color_rx --once --output /tmp/frame_test.rgb565
+sudo ./build/pcie_color_rx --safe-stop
+sudo rmmod colorbar_pcie_driver
+```
+
+这里建议第一次真实测试先用：
+
+```text
+frame_wait_ms=50
+output=/tmp/frame_test.rgb565
+只执行一次 --once
+```
+
+如果成功，再检查文件：
+
+```sh
+ls -lh /tmp/frame_test.rgb565
+sudo ./build/pcie_color_rx --validate /tmp/frame_test.rgb565
+```
+
+### 5. 当前不要做的事
+
+```text
+不要循环执行 --once。
+不要把输出先写到工程目录或系统盘关键路径。
+不要长时间加载 allow_dma_start=1 的驱动不卸载。
+不要在第一次真实 DMA 失败后立刻盲目换 bar/addr_byteswap 继续试。
+```
+
+如果真实 DMA 后系统异常，下一轮优先回退到安全模式，并检查：
+
+```text
+bar=1 是否正确
+addr_byteswap=1 是否正确
+FPGA 是否真的响应 0x130 STOP
+FPGA MWR 长度是否超过 Linux buffer
+FPGA 是否只写 Linux 驱动打印出来的 coherent DMA 地址
+```
+

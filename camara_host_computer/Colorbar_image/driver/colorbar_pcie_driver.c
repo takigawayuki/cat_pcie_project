@@ -235,6 +235,10 @@ static long colorbar_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 			frame.buffer_index = (cdev->frame_counter - 1) % COLORBAR_BUFFER_COUNT;
 			frame.valid_size = COLORBAR_FRAME_SIZE;
 			frame.flags = 0;
+
+			/* One-shot safety: close the DMA window before userspace copies data. */
+			colorbar_stop_locked(cdev);
+
 			if (copy_to_user((void __user *)arg, &frame, sizeof(frame)))
 				ret = -EFAULT;
 		}
