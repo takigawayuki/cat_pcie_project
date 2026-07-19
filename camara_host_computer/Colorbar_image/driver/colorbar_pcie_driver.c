@@ -58,9 +58,9 @@ static bool block_unsafe_dma;
 module_param(block_unsafe_dma, bool, 0644);
 MODULE_PARM_DESC(block_unsafe_dma, "legacy emergency block switch; keep false for new ARM/LEN/START FPGA protocol");
 
-static uint dma_len_bytes = 64;
+static uint dma_len_bytes = COLORBAR_DMA_MAX_BYTES;
 module_param(dma_len_bytes, uint, 0644);
-MODULE_PARM_DESC(dma_len_bytes, "requested DMA byte length: default 64 for safe staged validation; use 4096 then full frame explicitly");
+MODULE_PARM_DESC(dma_len_bytes, "requested DMA byte length; default matches PCIE_DMA_safe_test_8 forced full-frame transfer");
 
 static uint frame_wait_ms = 100;
 module_param(frame_wait_ms, uint, 0644);
@@ -73,7 +73,7 @@ MODULE_PARM_DESC(verify_readback, "read ADDR_ECHO0..3 and STATUS before START; d
 static bool colorbar_dma_len_valid(void)
 {
 	return dma_len_bytes >= COLORBAR_DMA_MIN_BYTES &&
-	       dma_len_bytes <= COLORBAR_FRAME_SIZE &&
+	       dma_len_bytes <= COLORBAR_DMA_MAX_BYTES &&
 	       (dma_len_bytes % COLORBAR_DMA_ALIGN_BYTES) == 0;
 }
 
@@ -142,7 +142,7 @@ static int colorbar_alloc_buffers_locked(struct colorbar_device *cdev)
 	if (!buffer_size) {
 		dev_err(&cdev->pdev->dev,
 			"refuse to allocate DMA buffers: invalid dma_len_bytes=%u, valid range %u..%u and %u-byte aligned\n",
-			dma_len_bytes, COLORBAR_DMA_MIN_BYTES, COLORBAR_FRAME_SIZE,
+			dma_len_bytes, COLORBAR_DMA_MIN_BYTES, COLORBAR_DMA_MAX_BYTES,
 			COLORBAR_DMA_ALIGN_BYTES);
 		return -EINVAL;
 	}
@@ -326,7 +326,7 @@ static int colorbar_start_locked(struct colorbar_device *cdev)
 	if (!colorbar_dma_len_valid()) {
 		dev_err(&cdev->pdev->dev,
 			"refuse to start FPGA DMA: invalid dma_len_bytes=%u, valid range %u..%u and %u-byte aligned\n",
-			dma_len_bytes, COLORBAR_DMA_MIN_BYTES, COLORBAR_FRAME_SIZE,
+			dma_len_bytes, COLORBAR_DMA_MIN_BYTES, COLORBAR_DMA_MAX_BYTES,
 			COLORBAR_DMA_ALIGN_BYTES);
 		return -EINVAL;
 	}

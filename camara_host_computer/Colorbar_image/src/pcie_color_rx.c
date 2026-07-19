@@ -47,6 +47,7 @@ static void print_info(void)
     printf("  format          : RGB565\n");
     printf("  frame_size      : %u bytes\n", COLORBAR_FRAME_SIZE);
     printf("  mark_size       : %u bytes\n", COLORBAR_MARK_SIZE);
+    printf("  dma_max_bytes   : %u bytes\n", COLORBAR_DMA_MAX_BYTES);
     printf("  buffer_count    : %u\n", COLORBAR_BUFFER_COUNT);
     printf("  buffer_size     : %u bytes\n", COLORBAR_BUFFER_SIZE);
     printf("  default device  : %s\n", COLORBAR_DEVICE_PATH);
@@ -231,7 +232,7 @@ static int capture_once(const char *device, const char *output)
         goto out_stop;
     }
 
-    if (frame.valid_size == 0 || frame.valid_size > COLORBAR_FRAME_SIZE) {
+    if (frame.valid_size == 0 || frame.valid_size > COLORBAR_DMA_MAX_BYTES) {
         fprintf(stderr, "invalid frame valid_size: %u\n", frame.valid_size);
         goto out_stop;
     }

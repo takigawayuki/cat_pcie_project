@@ -2134,3 +2134,184 @@ addr_error=0
 frame_done=1 或者 host_start 曾经为 1
 hexdump 不再全是 cd
 ```
+
+## 2026-07-20：PCIE_DMA_safe_test_8 强制整帧后的 Linux 侧修改
+
+### 1. FPGA test_8 改动摘要
+
+当前 FPGA 参考工程更新为：
+
+```text
+PCIE_DMA_safe_test_8
+```
+
+FPGA 侧现在不再使用 Linux 写入的 `0x108 LEN` 控制传输长度，而是强制：
+
+```text
+DMA_FORCED_BYTES = DMA_DEFAULT_BYTES = 4147264
+requested_tlps = (4147264 + 63) >> 6
+full_frame_mode = 1
+fixed_test_mode = 0
+```
+
+含义：
+
+```text
+即使 Linux 驱动写 dma_len_bytes=64，FPGA 仍会按 4147264 字节发送。
+```
+
+所以 test_8 之后，64B 小包测试不能再用于真实 DMA。
+
+### 2. Linux 侧为什么必须改
+
+旧 Linux 驱动默认 `dma_len_bytes=64`，会只分配：
+
+```text
+buffer size = 4096
+```
+
+但 FPGA test_8 会写：
+
+```text
+4147264 bytes
+```
+
+如果用 4096 字节 buffer 承接 4147264 字节 DMA，会越界写主机内存，有系统崩溃和文件系统损坏风险。
+
+### 3. Linux 侧已经修改的内容
+
+Linux 侧已把最大 DMA 长度定义为：
+
+```text
+COLORBAR_DMA_MAX_BYTES = COLORBAR_FRAME_SIZE + COLORBAR_MARK_SIZE
+                       = 4147200 + 64
+                       = 4147264
+```
+
+驱动现在允许：
+
+```text
+dma_len_bytes <= 4147264
+```
+
+用户态工具现在也允许保存：
+
+```text
+valid_size <= 4147264
+```
+
+加载脚本默认长度已改为：
+
+```text
+dma_len_bytes=4147264
+```
+
+注意：默认仍然是：
+
+```text
+allow_dma_start=0
+```
+
+所以默认加载驱动不会启动 DMA。
+
+### 4. test_8 下绝对不要执行的命令
+
+不要再执行：
+
+```sh
+./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=64
+sudo ./build/pcie_color_rx --once --output /tmp/frame_64.bin
+```
+
+也不要执行：
+
+```sh
+./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=4096
+```
+
+原因：FPGA 不再按 64B 或 4KB 发送，而是强制 4147264 字节。
+
+### 5. test_8 安全测试命令
+
+先重新编译：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo make
+```
+
+先做一次“只分配 buffer、不启动 DMA”的安全检查。注意：buffer 是用户态 `--once` 调用 `COLORBAR_IOC_ALLOC_BUFS` 时才分配的，不是 `load_driver.sh` 后立刻分配。
+
+```sh
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+./scripts/load_driver.sh dma_len_bytes=4147264
+sudo ./build/pcie_color_rx --once --output /tmp/should_not_start_test8.bin
+sudo dmesg | tail -n 120
+```
+
+这一步预期 `--once` 被安全闸门拒绝：
+
+```text
+COLORBAR_IOC_START: Operation not permitted
+```
+
+同时 dmesg 必须看到类似：
+
+```text
+buffer0 ... size=4149248 requested_len=4147264
+buffer1 ... size=4149248 requested_len=4147264
+buffer2 ... size=4149248 requested_len=4147264
+buffer3 ... size=4149248 requested_len=4147264
+```
+
+只要看到：
+
+```text
+size=4096
+```
+
+立刻停止，不要执行真实 DMA。
+
+确认 buffer 足够后，再重新加载并允许 DMA：
+
+```sh
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=4147264
+sudo ./build/pcie_color_rx --once --output /tmp/frame_full_test8.rgb565
+hexdump -C /tmp/frame_full_test8.rgb565 | head
+sudo dmesg | tail -n 160
+```
+
+### 6. test_8 结果怎么判断
+
+输出文件大小应该是：
+
+```text
+4147264 bytes
+```
+
+其中前面：
+
+```text
+4147200 bytes
+```
+
+是 RGB565 1920x1080 图像数据。
+
+最后：
+
+```text
+64 bytes
+```
+
+是 FPGA 额外标记或尾部测试区。
+
+如果 hexdump 仍然大面积是：
+
+```text
+cd cd cd cd ...
+```
+
+说明 FPGA DMA 数据没有真正写入 host buffer。
+
+如果系统稳定、文件大小正确、数据不是全 cd，再继续做 RGB565 彩条采样校验。
