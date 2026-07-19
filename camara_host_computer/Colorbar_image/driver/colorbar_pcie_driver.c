@@ -14,7 +14,7 @@
 
 #include "colorbar_pcie_driver.h"
 
-#define COLORBAR_DMA_PREFILL_PATTERN 0xA5
+#define COLORBAR_DMA_PREFILL_PATTERN 0xCD
 
 struct colorbar_dma_buffer {
 	void *cpu_addr;
@@ -204,6 +204,23 @@ static u32 colorbar_read_cmd32(struct colorbar_device *cdev, u32 offset)
 	return value;
 }
 
+static u32 colorbar_read_status_locked(struct colorbar_device *cdev, const char *phase)
+{
+	u32 status = colorbar_ioread32(cdev, COLORBAR_REG_DMA_STATUS);
+
+	dev_info(&cdev->pdev->dev,
+		 "read STATUS %s: 0x%08x busy=%u done=%u addr_error=%u arm=%u start=%u pcie_dma_enable=%u rc_cfg_ep=%u\n",
+		 phase, status, !!(status & COLORBAR_STATUS_BUSY),
+		 !!(status & COLORBAR_STATUS_FRAME_DONE),
+		 !!(status & COLORBAR_STATUS_ADDR_ERROR),
+		 !!(status & COLORBAR_STATUS_HOST_ARM),
+		 !!(status & COLORBAR_STATUS_HOST_START),
+		 !!(status & COLORBAR_STATUS_PCIE_DMA_ENABLE),
+		 !!(status & COLORBAR_STATUS_RC_CFG_EP));
+
+	return status;
+}
+
 static void colorbar_write_cmd32(struct colorbar_device *cdev, u32 value, u32 offset)
 {
 	u32 written = swab32(value);
@@ -255,16 +272,7 @@ static int colorbar_verify_readback_locked(struct colorbar_device *cdev)
 		}
 	}
 
-	status = colorbar_read_cmd32(cdev, COLORBAR_REG_DMA_STATUS);
-	dev_info(&cdev->pdev->dev,
-		 "read STATUS before START: 0x%08x busy=%u done=%u addr_error=%u arm=%u start=%u pcie_dma_enable=%u rc_cfg_ep=%u\n",
-		 status, !!(status & COLORBAR_STATUS_BUSY),
-		 !!(status & COLORBAR_STATUS_FRAME_DONE),
-		 !!(status & COLORBAR_STATUS_ADDR_ERROR),
-		 !!(status & COLORBAR_STATUS_HOST_ARM),
-		 !!(status & COLORBAR_STATUS_HOST_START),
-		 !!(status & COLORBAR_STATUS_PCIE_DMA_ENABLE),
-		 !!(status & COLORBAR_STATUS_RC_CFG_EP));
+	status = colorbar_read_status_locked(cdev, "before START");
 
 	if (status & COLORBAR_STATUS_ADDR_ERROR)
 		return -EIO;
@@ -441,6 +449,7 @@ static long colorbar_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 			frame.valid_size = dma_len_bytes;
 			frame.flags = 0;
 
+			colorbar_read_status_locked(cdev, "after wait before STOP");
 			colorbar_stop_locked(cdev);
 
 			if (copy_to_user((void __user *)arg, &frame, sizeof(frame)))

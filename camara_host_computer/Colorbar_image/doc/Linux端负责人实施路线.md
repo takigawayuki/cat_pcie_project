@@ -531,12 +531,12 @@ FPGA 真的写入了 0 数据
 FPGA 没有写入，Linux 读到的是驱动预清零内容
 ```
 
-当前驱动已经改为 START 前用 `0xA5` 预填充 DMA buffer。重新编译并重复 64B 后，判断方式如下：
+当前驱动已经改为 START 前用 `0xCD` 预填充 DMA buffer。`0xCD` 和 FPGA fixed_test_mode 的 `A5A50000..A5A5000F` 明显不同，便于判断 DMA 是否真的改写了 host buffer。重新编译并重复 64B 后，判断方式如下：
 
 ```text
-如果 /tmp/frame_64.bin 仍然全是 a5，说明 FPGA 大概率没有写入 host buffer。
+如果 /tmp/frame_64.bin 仍然全是 cd，说明 FPGA 大概率没有写入 host buffer。
 如果 /tmp/frame_64.bin 出现 A5A50000..A5A5000F 规律数据，说明 PCIE_DMA_safe_test_4 的 fixed_test_mode 已经写入成功。
-如果系统不崩溃但数据全 a5，下一步查 FPGA 的 host_start_flag、pcie_dma_enable、AXIS_S_TVALID/TREADY/TLAST。
+如果系统不崩溃但数据全 cd，下一步查 FPGA 的 host_start_flag、pcie_dma_enable、AXIS_S_TVALID/TREADY/TLAST。
 ```
 
 重复 64B 的命令：
@@ -696,9 +696,9 @@ dmesg 出现 kernel oops、SError、PCIe AER 异常
 
 ### 12. 当前风险边界
 
-`0x170 STATUS` 目前在源码里是内部状态信号，没有确认可通过 PCIe MRd 读回。所以 Linux 端暂时不能用它轮询完成，只能用 `frame_wait_ms` 等待后 STOP。
+`0x170 STATUS` 在 `PCIE_DMA_safe_test_4` 中已经可以通过 PCIe MRd 读到。当前 Linux 驱动先采用保守方式：START 后等待 `frame_wait_ms`，然后在 STOP 前读取一次 STATUS，用它辅助判断 FPGA 状态机有没有启动、完成或报地址错误。
 
-后续 FPGA 如果把 STATUS 做成可读寄存器，Linux 驱动应改为轮询 `frame_done_flag`，不要长期依赖固定延时。
+后续如果 STATUS 行为稳定，Linux 驱动可以从固定延时改成轮询 `frame_done_flag`，但在 64B 数据真正落到 host buffer 前，暂时不扩大 DMA 长度。
 
 
 
@@ -857,7 +857,7 @@ raw = ioread32(BAR + offset)
 value = swab32(raw)
 ```
 
-现在 `ADDR_ECHO0..3` 和 `STATUS` 都按解码后的 `value` 判断。
+现在 `ADDR_ECHO0..3` 按 `swab32(raw)` 后的 `value` 判断；`STATUS` 按 raw 低位判断，不再做 `swab32()`。
 
 ### 3. 重新测试命令
 
@@ -883,6 +883,225 @@ program DMA command: offset=0x104 value=0x00000001 written=0x01000000
 ```
 
 如果这些都通过，才说明 START 真正写出去了。随后看 `/tmp/frame_64_test4_readfix.bin` 是否是 64 字节，并且是否出现 `A5A50000..A5A5000F` 规律数据。
+
+
+
+## 2026-07-20：ADDR_ECHO 和 START 已通过，但 64B buffer 未被改写
+
+### 1. 本次结果
+
+执行 `PCIE_DMA_safe_test_4` 64B 测试后：
+
+```text
+ADDR_ECHO0..3 全部 decoded=expected
+STATUS before START raw 为 0x00000050
+START written=0x01000000
+/tmp/frame_64_test4_readfix.bin 大小为 64 字节
+文件内容全是 a5
+系统没有崩溃
+```
+
+关键结论：
+
+```text
+Linux -> FPGA 的 ARM/LEN/ADDR/ADDR_ECHO/START 控制链路已经基本打通。
+但是 FPGA 的 MWR 数据还没有确认写进 Linux host buffer。
+```
+
+旧日志里全 `a5` 的含义是：当时 Linux 驱动在 START 前用 `0xA5` 预填充了 DMA buffer，测试后还是 `0xA5`，说明 host buffer 内容没有变化。当前新驱动已改成预填 `0xCD`，新测试应按“是否全 cd”判断。
+
+### 2. 为什么还不能测 4KB
+
+`PCIE_DMA_safe_test_4` 的 64B fixed_test_mode 理论上应该写固定数据：
+
+```text
+A5A50000, A5A50001, ..., A5A5000F
+```
+
+如果 Linux 读出来仍然全是：
+
+```text
+cd cd cd cd ...
+```
+
+就不能证明 FPGA MWR 已经落到主机内存。因此暂时不能扩大到 4KB 或全帧。
+
+### 3. Linux 驱动新增日志
+
+已修正 STATUS 解析：
+
+```text
+STATUS 按 raw 低 8 位解释，不再 swab32 后解释。
+```
+
+已新增等待结束前状态读取：
+
+```text
+read STATUS after wait before STOP: ...
+```
+
+下一次 64B 测试要看 START 后 100ms 内，FPGA 是否出现：
+
+```text
+busy=1 或 done=1
+start=1 曾经有效
+rc_cfg_ep=1 曾经有效
+addr_error=0
+pcie_dma_enable=1
+```
+
+### 4. 重新测试命令
+
+注意：如果 dmesg 里还出现下面这种日志，说明当前正在运行的还是旧 ko：
+
+```text
+read DMA command: offset=0x170 raw=0x00000050 value=0x50000000
+read STATUS before START: 0x50000000 ... pcie_dma_enable=0
+```
+
+新驱动应该直接按 raw STATUS 打印，例如：
+
+```text
+read STATUS before START: 0x00000050 ... arm=1 ... pcie_dma_enable=1
+```
+
+所以重新测试前必须重新编译并重新加载驱动：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+make clean
+make
+sudo rmmod colorbar_pcie_driver
+./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=64
+sudo ./build/pcie_color_rx --once --output /tmp/frame_64_status.bin
+ls -lh /tmp/frame_64_status.bin
+hexdump -C /tmp/frame_64_status.bin | head
+sudo dmesg | tail -n 220
+```
+
+### 5. 判断方式
+
+如果看到：
+
+```text
+ADDR_ECHO0..3 全部 decoded=expected
+START written=0x01000000
+read STATUS after wait before STOP: ... done=1 ...
+hexdump 仍然全 cd
+```
+
+说明 FPGA 状态机可能认为完成，但 MWR 数据没有真正落到 Linux 地址，需要 FPGA 端查 MWR TLP 格式、AXIS_S_TVALID/TREADY/TLAST、目标地址字段。
+
+如果看到：
+
+```text
+ADDR_ECHO0..3 全部 decoded=expected
+START written=0x01000000
+read STATUS after wait before STOP: ... busy=0 done=0 start=0 rc_cfg_ep=0 ...
+hexdump 全 cd
+```
+
+说明 FPGA START 后没有进入 DMA 发送状态，重点查 `host_start_flag`、`fixed_test_mode`、`dma_len_valid`、`mwr_state`。
+
+如果看到文件出现 `A5A50000..A5A5000F` 规律数据，才允许进入 4KB。
+
+## 2026-07-20：本次日志结论和下一条命令
+
+### 1. 本次日志说明什么
+
+用户本次日志里已经看到：
+
+```text
+read ADDR_ECHO0 decoded=0xeec03000 expected=0xeec03000
+read ADDR_ECHO1 decoded=0xeec04000 expected=0xeec04000
+read ADDR_ECHO2 decoded=0xeec05000 expected=0xeec05000
+read ADDR_ECHO3 decoded=0xeec06000 expected=0xeec06000
+program DMA command: offset=0x104 value=0x00000001 written=0x01000000
+captured frame_counter=1 buffer=0 bytes=64
+```
+
+这说明：
+
+```text
+Linux 写 BAR1 命令没有问题。
+ARM/LEN/ADDR 四个地址已经被 FPGA 保存并可读回。
+START 已经写出。
+64B 测试没有导致系统崩溃。
+```
+
+但是输出文件仍然是：
+
+```text
+cd cd cd cd ...
+```
+
+这不是成功图像数据。当前新驱动在 START 前会把 DMA buffer 预填成 `0xCD`，如果测试后仍然全 `0xCD`，表示 FPGA 的 MWr 数据还没有确认写进 Linux buffer。
+
+### 2. 为什么这次还不能测 4KB
+
+`PCIE_DMA_safe_test_4` 的 64B fixed_test_mode 理论预期是固定 16 个 32-bit word：
+
+```text
+A5A50000
+A5A50001
+...
+A5A5000F
+```
+
+考虑字节序，hexdump 可能表现为下列两类之一：
+
+```text
+00 00 a5 a5 01 00 a5 a5 ...
+a5 a5 00 00 a5 a5 00 01 ...
+```
+
+但不应该是整段全 `cd`。
+
+所以当前不能测：
+
+```sh
+./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=4096
+./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=4147200
+```
+
+### 3. 下一步只做这一组命令
+
+执行：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+make clean
+make
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=64
+sudo ./build/pcie_color_rx --once --output /tmp/frame_64_status.bin
+ls -lh /tmp/frame_64_status.bin
+hexdump -C /tmp/frame_64_status.bin | head
+sudo dmesg | tail -n 220
+```
+
+这组命令的目的不是测图像，而是只验证 64B 的 fixed_test_mode 是否真的写入 host buffer。
+
+### 4. 下一步重点看什么
+
+先看 dmesg 是否已经是新驱动格式：
+
+```text
+read STATUS before START: 0x00000050 ...
+read STATUS after wait before STOP: ...
+```
+
+再看 `after wait before STOP`：
+
+```text
+done=1, addr_error=0
+```
+
+如果 `done=1` 但 hexdump 仍然全 `cd`，结论偏向 FPGA MWr TLP 没有真正落到 RK3568 内存，FPGA 端需要查 MWr 数据通道。
+
+如果 `done=0` 且 hexdump 全 `cd`，结论偏向 FPGA START 后没有进入发送状态，FPGA 端需要查 `host_start_flag`、`fixed_test_mode`、`dma_len_valid`、`mwr_state`。
+
+如果 hexdump 出现 `A5A50000..A5A5000F` 的规律数据，64B 通过，才进入 4KB。
 
 ## 2026-07-19：如果还是异常，下一步查什么
 
@@ -973,3 +1192,232 @@ pcie_dma_enable = 1
 ```text
 以 PCIE_DMA_safe_test_4 为 FPGA 唯一依据，Linux 按 ARM/LEN/ADDR/START 新握手写寄存器，并且 LEN/START/ADDR 都按 FPGA cmd_data 字节反转规则处理；测试必须 64B -> 4KB -> 4147200B 逐步放大。
 ```
+
+## 2026-07-20：关于是否可能是位宽不匹配
+
+### 1. 当前日志先说明什么
+
+最新 64B 测试中，关键日志是：
+
+```text
+read ADDR_ECHO0 decoded=0xeec03000 expected=0xeec03000
+read ADDR_ECHO1 decoded=0xeec04000 expected=0xeec04000
+read ADDR_ECHO2 decoded=0xeec05000 expected=0xeec05000
+read ADDR_ECHO3 decoded=0xeec06000 expected=0xeec06000
+read STATUS before START: 0x00000050 busy=0 done=0 addr_error=0 arm=1 start=0 pcie_dma_enable=1 rc_cfg_ep=0
+program DMA command: offset=0x104 value=0x00000001 written=0x01000000
+read STATUS after wait before STOP: 0x00000050 busy=0 done=0 addr_error=0 arm=1 start=0 pcie_dma_enable=1 rc_cfg_ep=0
+```
+
+这说明：
+
+```text
+Linux -> FPGA 的 BAR 写命令路径已经能工作。
+FPGA 已经正确保存并读回 4 个 DMA 地址。
+BusMaster/pcie_dma_enable 已经打开。
+但是 START 后 host_start_flag 仍然是 0，frame_done_flag 也是 0。
+```
+
+所以当前最直接的问题不是“图像数据格式不对”，而是：
+
+```text
+FPGA 没有确认接收到 START，或者 START 条件没有命中。
+```
+
+### 2. 会不会是位宽不匹配
+
+有可能，但要分成两类看。
+
+第一类是 Linux DMA buffer 位宽不匹配：
+
+```text
+概率低。
+```
+
+原因是 Linux 端只是给 FPGA 一个 32-bit DMA bus address，buffer 是按 byte 地址访问的 coherent memory。PCIe MWr 写 32-bit、64-bit、128-bit payload，本质上都落到同一段物理地址空间。只要 FPGA TLP 地址和 length 正确，Linux 不需要知道 FPGA 内部 AXIS 是 32 位、64 位还是 128 位。
+
+第二类是 FPGA PCIe AXIS/TLP 组包位宽或 lane 放置不匹配：
+
+```text
+需要重点怀疑。
+```
+
+当前 `PCIE_DMA_safe_test_4/source/pcie_dma_ctrl.v` 里：
+
+```text
+axis_master_tdata  是 128 位
+axis_master_tkeep  是 4 位
+AXIS_S_TDATA       是 128 位
+AXIS_S_TKEEP       没有出现在 pcie_dma_ctrl 输出接口
+```
+
+如果 Pango PCIe IP 的 AXIS slave TX 口需要 `tkeep` 或者要求 header/data 放在特定 32-bit lane，而 FPGA 组包没有严格匹配 IP 手册，那么 FPGA 发出的 MWr TLP 可能不会被 RK3568 Root Complex 正确接收。
+
+不过按照当前 STATUS 来看，MWr 数据发送还不是第一优先级。因为如果只是 TX MWr 位宽不匹配，通常 START 后至少应该看到：
+
+```text
+start=1
+rc_cfg_ep=1
+busy=1
+或者 done 有变化
+```
+
+但现在 START 后 STATUS 仍然是：
+
+```text
+0x00000050 = arm=1 + pcie_dma_enable=1
+```
+
+`start=0`、`done=0`，说明 FPGA 的 START 命令解析本身还没确认成功。
+
+### 3. 当前第一优先级排查点
+
+FPGA 端 ILA 先抓 START 这一次 host MWr，不要先抓全帧视频。
+
+触发条件建议：
+
+```text
+cmd_reg_addr == 12'h104
+```
+
+必须确认这些信号：
+
+```text
+tlp_fmt
+tlp_type
+tlp_lenght
+cmd_reg_addr
+cmd_data
+host_arm_flag
+dma_addr_valid
+dma_len_valid
+host_start_flag
+addr_error_flag
+pcie_dma_enable
+axis_master_tdata_d0
+axis_master_tkeep
+axis_master_tvalid_d0
+axis_master_tvalid_d1
+```
+
+START 写入时理论预期：
+
+```text
+{tlp_fmt, tlp_type} = 8'h40
+ tlp_lenght = 1
+ cmd_reg_addr = 12'h104
+ cmd_data = 32'h00000001
+ host_arm_flag = 1
+ dma_addr_valid = 1
+ dma_len_valid = 1
+ host_start_flag 变成 1
+ addr_error_flag = 0
+```
+
+### 4. 如果 START 没有命中，优先查这些
+
+如果 ILA 看不到 `cmd_reg_addr == 12'h104`：
+
+```text
+说明 Linux 的 0x104 MWr 没被 FPGA 当前解析逻辑识别，重点查 TLP header 解析位段和 address lane。
+```
+
+如果看到 `cmd_reg_addr == 12'h104`，但 `cmd_data != 32'h00000001`：
+
+```text
+说明 START 数据所在 lane 或字节序不对。重点查 128-bit AXIS 下 payload 是不是固定在 axis_master_tdata_d0[31:0]。
+```
+
+如果看到 `cmd_data == 32'h00000001`，但 `host_start_flag` 不变 1：
+
+```text
+重点查 dma_addr_valid 和 dma_len_valid。
+```
+
+如果 `host_start_flag` 曾经变 1，但很快又掉回 0，同时 `done=0`：
+
+```text
+重点查 dma_stop_flag、rstn、pcie_dma_enable 是否有瞬间抖动，或者状态机是否被复位条件清掉。
+```
+
+### 5. 如果 START 已经命中，再查位宽/TLP 发送
+
+只有确认 START 命中后，才继续查 MWr 发送位宽和 TLP 组包：
+
+```text
+mwr_state 是否进入 MWR_TLP_HEADER 和 MWR_TLP_DATA
+AXIS_S_TVALID 是否拉高
+AXIS_S_TREADY 是否为 1
+AXIS_S_TLAST 是否在 64B 最后一个 beat 拉高
+AXIS_S_TDATA header 是否是 MWr_32
+AXIS_S_TDATA address 是否等于 dma_addr0
+TLP_LENGTH 是否为 16DW/64B
+first/last byte enable 是否符合 64B 对齐写
+```
+
+64B fixed_test_mode 期望 FPGA 写入 16 个 32-bit word：
+
+```text
+A5A50000, A5A50001, ..., A5A5000F
+```
+
+Linux hexdump 只要仍然全是 `cd`，就不能进入 4KB 或全帧测试。
+
+## 2026-07-20：Linux 预填值应该怎么填
+
+### 1. 结论
+
+Linux 预填值不要填 FPGA 将要发送的固定测试数据。
+
+当前驱动预填：
+
+```text
+0xCD
+```
+
+FPGA 64B fixed_test_mode 期望写入：
+
+```text
+A5A50000, A5A50001, ..., A5A5000F
+```
+
+这样判断最清楚：
+
+```text
+hexdump 仍然全 cd：FPGA 没有写进 host buffer，或者 START/MWr 没真正发生。
+hexdump 出现 A5A50000..A5A5000F：FPGA fixed_test_mode 写入成功。
+hexdump 出现部分 cd、部分 A5A5 数据：可能是 TLP/byte enable/长度/last 有问题，需要继续查 FPGA MWr 组包。
+```
+
+### 2. 为什么不继续填 0xA5
+
+`0xA5` 和 FPGA 预期数据 `A5A50000..A5A5000F` 的高字节重复，容易让肉眼判断混乱。比如 `A5A50000` 在 hexdump 里本来就会出现 `a5 a5` 相关字节。
+
+预填 `0xCD` 的好处是：
+
+```text
+0xCD 不属于 FPGA 固定测试序列。
+DMA 没写入时一眼就是 cd cd cd cd。
+DMA 写入成功时会明显变成 A5A50000..A5A5000F 对应字节。
+```
+
+### 3. 修改位置
+
+```text
+camara_host_computer/Colorbar_image/driver/colorbar_pcie_driver.c
+COLORBAR_DMA_PREFILL_PATTERN = 0xCD
+```
+
+修改后必须重新编译并重新加载驱动：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+make clean
+make
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=64
+sudo ./build/pcie_color_rx --once --output /tmp/frame_64_cd_prefill.bin
+hexdump -C /tmp/frame_64_cd_prefill.bin | head
+sudo dmesg | tail -n 220
+```
+
