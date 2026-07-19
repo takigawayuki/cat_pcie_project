@@ -370,7 +370,7 @@ static int colorbar_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	pci_set_drvdata(pdev, cdev);
 	g_cdev = cdev;
 
-	dev_info(&pdev->dev, "colorbar PCIe RX probe ok, BAR%d len=0x%pa, BusMaster disabled until START\n",
+	dev_info(&pdev->dev, "colorbar PCIe RX probe ok, BAR%d len=%pa, BusMaster disabled until START\n",
 		 bar, &cdev->bar_len);
 	return 0;
 

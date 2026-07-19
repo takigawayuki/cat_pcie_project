@@ -2482,3 +2482,121 @@ sudo rmmod colorbar_pcie_driver
 可以开始下一步，但下一步应先验证 BusMaster 默认关闭；真正 allow_dma_start=1 只能作为有备份前提下的一次性受控测试，不能当作已经完全安全。
 ```
 
+## 2026-7-19 新版驱动 BusMaster 验证结果
+
+### 1. 本次实际打印结果
+
+加载新版驱动后执行：
+
+```sh
+lspci -vv -s 01:00.0 | grep -E "Control:|Region|LnkSta"
+```
+
+当前输出重点：
+
+```text
+Control: I/O- Mem+ BusMaster- SpecCycle- MemWINV- VGASnoop- ParErr- Stepping- SERR- FastB2B- DisINTx-
+Region 0: Memory at f4200000 (32-bit, non-prefetchable) [size=8K]
+Region 1: Memory at f4204000 (32-bit, non-prefetchable) [size=4K]
+Region 2: Memory at f4202000 (64-bit, non-prefetchable) [size=8K]
+LnkSta: Speed 2.5GT/s (ok), Width x1 (ok)
+```
+
+`dmesg` 当前输出重点：
+
+```text
+colorbar_pcie_rx 0000:01:00.0: sent DMA STOP + cleared dma_addr0..3 on BAR1
+colorbar_pcie_rx 0000:01:00.0: colorbar PCIe RX probe ok, BAR1 len=0x0x0000000000001000, BusMaster disabled until START
+colorbar PCIe RX driver loaded
+```
+
+其中 `BAR1 len=0x0x...` 只是日志格式多打印了一个 `0x`，不影响功能；代码里已经修正为后续打印 `BAR1 len=0x0000000000001000` 这种形式。
+
+### 2. 本次结论
+
+这次结果是符合预期的：
+
+```text
+[x] PCIe 仍然 Link Up，Speed 2.5GT/s，Width x1
+[x] FPGA Endpoint 仍然正常枚举
+[x] BAR0/BAR1/BAR2 仍然正常分配
+[x] 驱动已绑定 01:00.0
+[x] 驱动 probe 阶段执行了 safe-stop
+[x] 驱动加载后 lspci 显示 BusMaster-
+[x] 新版驱动确认：BusMaster disabled until START
+```
+
+`BusMaster-` 的含义很关键：
+
+```text
+当前驱动加载完成后，FPGA 没有被 Linux 长时间允许主动发起 DMA Memory Write。
+只有后续显式 allow_dma_start=1 并执行 --once 时，驱动才会临时打开 Bus Master。
+```
+
+所以这次已经验证：
+
+```text
+“加载驱动就可能让 FPGA 长时间乱写主机内存”这个风险已经被新版驱动明显降低。
+```
+
+### 3. 日志里 PCIe Link Fail 怎么看
+
+`dmesg` 前面还能看到启动早期的：
+
+```text
+rk-pcie 3c0800000.pcie: PCIe Linking... LTSSM is 0x0
+rk-pcie 3c0800000.pcie: PCIe Link Fail
+rk-pcie 3c0800000.pcie: failed to initialize host
+```
+
+但当前 `lspci` 已经能看到 `01:00.0`，并且 `LnkSta` 是：
+
+```text
+Speed 2.5GT/s (ok), Width x1 (ok)
+```
+
+所以当前判断：
+
+```text
+这些 Link Fail 更像是启动过程中某个 PCIe 控制器或早期扫描阶段的历史日志。
+不能用它否定当前 01:00.0 已经 Link Up 的事实。
+当前状态以 lspci 的实时结果为准。
+```
+
+### 4. 下一步命令
+
+下一步仍然先不打开 `allow_dma_start=1`，先跑安全路径：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo ./build/pcie_color_rx --safe-stop
+dmesg | tail -n 50
+sudo ./build/pcie_color_rx --once --output /tmp/frame_test.rgb565
+```
+
+预期：
+
+```text
+--safe-stop 输出 sent safe stop to /dev/colorbar_pcie_rx
+--once 输出 COLORBAR_IOC_START: Operation not permitted
+```
+
+如果这两个结果都符合，Linux 侧进入“可做一次性受控 DMA 测试”的前置状态。
+
+### 5. 是否可以开始真正一帧测试
+
+可以，但不是无风险。建议只在已经备份系统卡、能接受系统异常后重刷的前提下做一次。
+
+受控一帧测试仍然使用：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 allow_dma_start=1 frame_wait_ms=100
+sudo ./build/pcie_color_rx --once --output /tmp/frame_test.rgb565
+sudo ./build/pcie_color_rx --safe-stop
+sudo rmmod colorbar_pcie_driver
+```
+
+如果没有备份系统卡，当前不建议执行上面这组 `allow_dma_start=1` 命令。
+
