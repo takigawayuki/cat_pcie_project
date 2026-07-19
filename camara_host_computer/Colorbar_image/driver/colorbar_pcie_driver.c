@@ -10,6 +10,7 @@
 #include <linux/slab.h>
 #include <linux/swab.h>
 #include <linux/uaccess.h>
+#include <linux/version.h>
 
 #include "colorbar_pcie_driver.h"
 
@@ -27,7 +28,9 @@ struct colorbar_device {
 	struct colorbar_dma_buffer bufs[COLORBAR_BUFFER_COUNT];
 	bool bufs_allocated;
 	bool started;
+	bool frame_ready;
 	u32 frame_counter;
+	u32 last_buffer_index;
 };
 
 static struct colorbar_device *g_cdev;
@@ -42,15 +45,44 @@ MODULE_PARM_DESC(bar, "FPGA BAR index for colorbar control registers");
 
 static bool addr_byteswap = true;
 module_param(addr_byteswap, bool, 0644);
-MODULE_PARM_DESC(addr_byteswap, "byteswap 32-bit DMA address before writing BAR+0x110");
+MODULE_PARM_DESC(addr_byteswap, "byteswap 32-bit DMA address before writing BAR+0x110; default true for PCIE_DMA_safe_test cmd_data byte order");
 
 static bool allow_dma_start;
 module_param(allow_dma_start, bool, 0644);
-MODULE_PARM_DESC(allow_dma_start, "allow COLORBAR_IOC_START to program FPGA DMA addresses; default is false for safety");
+MODULE_PARM_DESC(allow_dma_start, "allow START after programming the new FPGA ARM/LEN/ADDR handshake; default false");
+
+static bool block_unsafe_dma;
+module_param(block_unsafe_dma, bool, 0644);
+MODULE_PARM_DESC(block_unsafe_dma, "legacy emergency block switch; keep false for new ARM/LEN/START FPGA protocol");
+
+static uint dma_len_bytes = COLORBAR_FRAME_SIZE;
+module_param(dma_len_bytes, uint, 0644);
+MODULE_PARM_DESC(dma_len_bytes, "requested DMA byte length: use 64, 4096, then full frame for staged validation");
 
 static uint frame_wait_ms = 100;
 module_param(frame_wait_ms, uint, 0644);
 MODULE_PARM_DESC(frame_wait_ms, "temporary wait time for one frame until FPGA frame-done status is available");
+
+static int colorbar_set_dma_mask(struct pci_dev *pdev)
+{
+	int ret;
+
+	/* The current FPGA colorbar path emits MWR_32 TLPs, so keep DMA below 4GB. */
+	ret = pci_set_dma_mask(pdev, DMA_BIT_MASK(32));
+	if (ret) {
+		dev_err(&pdev->dev, "failed to set 32-bit DMA mask: %d\n", ret);
+		return ret;
+	}
+
+	ret = pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(32));
+	if (ret) {
+		dev_err(&pdev->dev, "failed to set 32-bit consistent DMA mask: %d\n", ret);
+		return ret;
+	}
+
+	dev_info(&pdev->dev, "using 32-bit DMA mask for colorbar MWR_32 path\n");
+	return 0;
+}
 
 static void colorbar_free_buffers_locked(struct colorbar_device *cdev)
 {
@@ -61,9 +93,9 @@ static void colorbar_free_buffers_locked(struct colorbar_device *cdev)
 
 	for (i = 0; i < COLORBAR_BUFFER_COUNT; i++) {
 		if (cdev->bufs[i].cpu_addr) {
-			dma_free_coherent(&cdev->pdev->dev, COLORBAR_BUFFER_SIZE,
-					  cdev->bufs[i].cpu_addr,
-					  cdev->bufs[i].dma_addr);
+			pci_free_consistent(cdev->pdev, COLORBAR_BUFFER_SIZE,
+					    cdev->bufs[i].cpu_addr,
+					    cdev->bufs[i].dma_addr);
 			cdev->bufs[i].cpu_addr = NULL;
 			cdev->bufs[i].dma_addr = 0;
 		}
@@ -71,7 +103,9 @@ static void colorbar_free_buffers_locked(struct colorbar_device *cdev)
 
 	cdev->bufs_allocated = false;
 	cdev->started = false;
+	cdev->frame_ready = false;
 	cdev->frame_counter = 0;
+	cdev->last_buffer_index = 0;
 }
 
 static int colorbar_alloc_buffers_locked(struct colorbar_device *cdev)
@@ -82,10 +116,9 @@ static int colorbar_alloc_buffers_locked(struct colorbar_device *cdev)
 		return 0;
 
 	for (i = 0; i < COLORBAR_BUFFER_COUNT; i++) {
-		cdev->bufs[i].cpu_addr = dma_alloc_coherent(&cdev->pdev->dev,
-							    COLORBAR_BUFFER_SIZE,
-							    &cdev->bufs[i].dma_addr,
-							    GFP_KERNEL);
+		cdev->bufs[i].cpu_addr = pci_alloc_consistent(cdev->pdev,
+							 COLORBAR_BUFFER_SIZE,
+							 &cdev->bufs[i].dma_addr);
 		if (!cdev->bufs[i].cpu_addr)
 			goto fail;
 
@@ -110,6 +143,21 @@ fail:
 	return -ENOMEM;
 }
 
+static void colorbar_iowrite32(struct colorbar_device *cdev, u32 value, u32 offset)
+{
+	iowrite32(value, cdev->bar + offset);
+}
+
+static void colorbar_write_cmd32(struct colorbar_device *cdev, u32 value, u32 offset)
+{
+	u32 written = swab32(value);
+
+	dev_info(&cdev->pdev->dev,
+		 "program DMA command: offset=0x%03x value=0x%08x written=0x%08x\n",
+		 offset, value, written);
+	colorbar_iowrite32(cdev, written, offset);
+}
+
 static void colorbar_write_dma_addr(struct colorbar_device *cdev, dma_addr_t dma_addr)
 {
 	u32 addr = lower_32_bits(dma_addr);
@@ -118,9 +166,8 @@ static void colorbar_write_dma_addr(struct colorbar_device *cdev, dma_addr_t dma
 	dev_info(&cdev->pdev->dev,
 		 "program DMA address: dma=%pad low32=0x%08x written=0x%08x addr_byteswap=%d\n",
 		 &dma_addr, addr, value, addr_byteswap);
-	iowrite32(value, cdev->bar + COLORBAR_REG_DMA_ADDR);
+	colorbar_iowrite32(cdev, value, COLORBAR_REG_DMA_ADDR);
 }
-
 
 static void colorbar_hw_safe_stop(struct colorbar_device *cdev)
 {
@@ -129,15 +176,18 @@ static void colorbar_hw_safe_stop(struct colorbar_device *cdev)
 	if (!cdev->bar)
 		return;
 
-	iowrite32(0, cdev->bar + COLORBAR_REG_DMA_STOP);
+	colorbar_iowrite32(cdev, 0, COLORBAR_REG_DMA_STOP);
 	wmb();
+	colorbar_iowrite32(cdev, 0, COLORBAR_REG_DMA_START);
+	colorbar_iowrite32(cdev, 0, COLORBAR_REG_DMA_ARM);
+	colorbar_iowrite32(cdev, 0, COLORBAR_REG_DMA_LEN);
 	for (i = 0; i < COLORBAR_BUFFER_COUNT; i++)
-		iowrite32(0, cdev->bar + COLORBAR_REG_DMA_ADDR);
+		colorbar_iowrite32(cdev, 0, COLORBAR_REG_DMA_ADDR);
 	wmb();
 	cdev->started = false;
 
 	dev_info(&cdev->pdev->dev,
-		 "sent DMA STOP + cleared dma_addr0..3 on BAR%d\n",
+		 "sent DMA STOP + cleared ARM/START/LEN/dma_addr0..3 on BAR%d\n",
 		 cdev->bar_index);
 }
 
@@ -148,17 +198,34 @@ static int colorbar_start_locked(struct colorbar_device *cdev)
 	if (!cdev->bufs_allocated)
 		return -EINVAL;
 
-	if (!allow_dma_start) {
+	if (block_unsafe_dma) {
 		dev_err(&cdev->pdev->dev,
-			"refuse to start FPGA DMA: reload with allow_dma_start=1 after BAR/address byte order is verified\n");
+			"refuse to start FPGA DMA: Pango-style rewrite keeps colorbar stream blocked until protocol is revalidated\n");
 		return -EPERM;
 	}
 
-	/* Keep Bus Master disabled while programming DMA addresses. */
+	if (!allow_dma_start) {
+		dev_err(&cdev->pdev->dev,
+			"refuse to start FPGA DMA: allow_dma_start=1 is not set\n");
+		return -EPERM;
+	}
+
+	if (dma_len_bytes == 0 || dma_len_bytes > COLORBAR_FRAME_SIZE) {
+		dev_err(&cdev->pdev->dev,
+			"refuse to start FPGA DMA: invalid dma_len_bytes=%u, max=%u\n",
+			dma_len_bytes, COLORBAR_FRAME_SIZE);
+		return -EINVAL;
+	}
+
 	pci_clear_master(cdev->pdev);
+	colorbar_hw_safe_stop(cdev);
 
 	for (i = 0; i < COLORBAR_BUFFER_COUNT; i++)
 		memset(cdev->bufs[i].cpu_addr, 0, COLORBAR_BUFFER_SIZE);
+
+	colorbar_write_cmd32(cdev, COLORBAR_DMA_ARM_MAGIC, COLORBAR_REG_DMA_ARM);
+	colorbar_write_cmd32(cdev, dma_len_bytes, COLORBAR_REG_DMA_LEN);
+	wmb();
 
 	for (i = 0; i < COLORBAR_BUFFER_COUNT; i++)
 		colorbar_write_dma_addr(cdev, cdev->bufs[i].dma_addr);
@@ -166,18 +233,22 @@ static int colorbar_start_locked(struct colorbar_device *cdev)
 	wmb();
 	pci_set_master(cdev->pdev);
 	wmb();
+	colorbar_write_cmd32(cdev, 1, COLORBAR_REG_DMA_START);
+	wmb();
+
 	cdev->started = true;
+	cdev->frame_ready = false;
 	cdev->frame_counter = 0;
+	cdev->last_buffer_index = 0;
 
 	dev_info(&cdev->pdev->dev,
-		 "started colorbar RX, addr_byteswap=%d, allow_dma_start=%d, wait_ms=%u, BusMaster enabled only for capture window\n",
-		 addr_byteswap, allow_dma_start, frame_wait_ms);
+		 "started colorbar RX with ARM/LEN/ADDR/START handshake, len=%u, addr_byteswap=%d, wait_ms=%u\n",
+		 dma_len_bytes, addr_byteswap, frame_wait_ms);
 	return 0;
 }
 
 static void colorbar_stop_locked(struct colorbar_device *cdev)
 {
-	/* Block further PCIe Memory Writes first; MMIO STOP does not require Bus Master. */
 	pci_clear_master(cdev->pdev);
 	colorbar_hw_safe_stop(cdev);
 }
@@ -230,13 +301,16 @@ static long colorbar_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 			mutex_unlock(&cdev->lock);
 			msleep(frame_wait_ms);
 			mutex_lock(&cdev->lock);
+
 			cdev->frame_counter++;
+			cdev->last_buffer_index = (cdev->frame_counter - 1) % COLORBAR_BUFFER_COUNT;
+			cdev->frame_ready = true;
+
 			frame.frame_counter = cdev->frame_counter;
-			frame.buffer_index = (cdev->frame_counter - 1) % COLORBAR_BUFFER_COUNT;
-			frame.valid_size = COLORBAR_FRAME_SIZE;
+			frame.buffer_index = cdev->last_buffer_index;
+			frame.valid_size = dma_len_bytes;
 			frame.flags = 0;
 
-			/* One-shot safety: close the DMA window before userspace copies data. */
 			colorbar_stop_locked(cdev);
 
 			if (copy_to_user((void __user *)arg, &frame, sizeof(frame)))
@@ -254,7 +328,7 @@ static long colorbar_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 
 	case COLORBAR_IOC_SAFE_STOP:
 		mutex_lock(&cdev->lock);
-		colorbar_hw_safe_stop(cdev);
+		colorbar_stop_locked(cdev);
 		mutex_unlock(&cdev->lock);
 		return 0;
 
@@ -263,41 +337,69 @@ static long colorbar_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 	}
 }
 
-static int colorbar_mmap(struct file *file, struct vm_area_struct *vma)
+static ssize_t colorbar_read(struct file *file, char __user *buf,
+				     size_t count, loff_t *ppos)
 {
 	struct colorbar_device *cdev = g_cdev;
-	unsigned long size = vma->vm_end - vma->vm_start;
-	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
-	unsigned int index;
-	unsigned long in_buf_offset;
-	int ret;
+	void *src;
+	size_t available;
+	size_t to_copy;
+	ssize_t ret;
 
 	if (!cdev || !cdev->pdev)
 		return -ENODEV;
 
 	mutex_lock(&cdev->lock);
-	if (!cdev->bufs_allocated) {
+	if (!cdev->bufs_allocated || !cdev->frame_ready) {
 		ret = -EINVAL;
 		goto out;
 	}
 
-	index = offset / COLORBAR_BUFFER_SIZE;
-	in_buf_offset = offset % COLORBAR_BUFFER_SIZE;
-	if (index >= COLORBAR_BUFFER_COUNT ||
-	    in_buf_offset + size > COLORBAR_BUFFER_SIZE ||
-	    (in_buf_offset & (PAGE_SIZE - 1))) {
-		ret = -EINVAL;
+	if (*ppos < 0 || *ppos >= dma_len_bytes) {
+		ret = 0;
 		goto out;
 	}
 
-	vma->vm_pgoff = in_buf_offset >> PAGE_SHIFT;
-	ret = dma_mmap_coherent(&cdev->pdev->dev, vma,
-				cdev->bufs[index].cpu_addr,
-				cdev->bufs[index].dma_addr,
-				COLORBAR_BUFFER_SIZE);
+	available = dma_len_bytes - (size_t)*ppos;
+	to_copy = min(count, available);
+	src = cdev->bufs[cdev->last_buffer_index].cpu_addr + *ppos;
+
+	if (copy_to_user(buf, src, to_copy)) {
+		ret = -EFAULT;
+		goto out;
+	}
+
+	*ppos += to_copy;
+	ret = to_copy;
+
 out:
 	mutex_unlock(&cdev->lock);
 	return ret;
+}
+
+static loff_t colorbar_llseek(struct file *file, loff_t off, int whence)
+{
+	loff_t newpos;
+
+	switch (whence) {
+	case SEEK_SET:
+		newpos = off;
+		break;
+	case SEEK_CUR:
+		newpos = file->f_pos + off;
+		break;
+	case SEEK_END:
+		newpos = dma_len_bytes + off;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (newpos < 0)
+		return -EINVAL;
+
+	file->f_pos = newpos;
+	return newpos;
 }
 
 static int colorbar_open(struct inode *inode, struct file *file)
@@ -314,26 +416,31 @@ static int colorbar_release(struct inode *inode, struct file *file)
 
 static const struct file_operations colorbar_fops = {
 	.owner = THIS_MODULE,
+	.llseek = colorbar_llseek,
+	.read = colorbar_read,
 	.open = colorbar_open,
 	.release = colorbar_release,
 	.unlocked_ioctl = colorbar_ioctl,
-	.mmap = colorbar_mmap,
 };
 
 static int colorbar_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct colorbar_device *cdev;
+	unsigned long bar_address;
 	int ret;
 
-	ret = pci_enable_device_mem(pdev);
-	if (ret)
-		return ret;
+	dev_info(&pdev->dev, "colorbar probe vendor=0x%x device=0x%x\n",
+		 pdev->vendor, pdev->device);
 
-	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+	ret = pci_enable_device(pdev);
 	if (ret) {
-		dev_err(&pdev->dev, "failed to set 32-bit DMA mask: %d\n", ret);
-		goto disable_device;
+		dev_err(&pdev->dev, "pci_enable_device failed: %d\n", ret);
+		return ret;
 	}
+
+	ret = colorbar_set_dma_mask(pdev);
+	if (ret)
+		goto disable_device;
 
 	if (bar < 0 || bar > 5) {
 		ret = -EINVAL;
@@ -356,26 +463,23 @@ static int colorbar_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	cdev->bar_index = bar;
 	cdev->bar_len = pci_resource_len(pdev, bar);
 	mutex_init(&cdev->lock);
-	cdev->bar = pci_iomap(pdev, bar, 0);
+
+	bar_address = pci_resource_start(pdev, bar);
+	cdev->bar = ioremap(bar_address, cdev->bar_len);
 	if (!cdev->bar) {
 		ret = -ENOMEM;
 		goto free_cdev;
 	}
 
-	/*
-	 * 安全保护：驱动加载阶段保持 Bus Master 关闭。
-	 * pci_enable_device_mem() 允许主机 MMIO 写 BAR，但不需要 FPGA
-	 * 具备主动 DMA 能力。probe 只做 STOP/清旧地址，真正 START
-	 * 时才短暂打开 Bus Master，降低错误 DMA 持续写内存的风险。
-	 */
 	pci_clear_master(pdev);
 	colorbar_hw_safe_stop(cdev);
 
 	pci_set_drvdata(pdev, cdev);
 	g_cdev = cdev;
 
-	dev_info(&pdev->dev, "colorbar PCIe RX probe ok, BAR%d len=%pa, BusMaster disabled until START\n",
-		 bar, &cdev->bar_len);
+	dev_info(&pdev->dev,
+		 "colorbar PCIe RX probe ok, BAR%d phys=0x%lx len=%pa, BusMaster disabled until START\n",
+		 bar, bar_address, &cdev->bar_len);
 	return 0;
 
 free_cdev:
@@ -396,17 +500,17 @@ static void colorbar_remove(struct pci_dev *pdev)
 
 	mutex_lock(&cdev->lock);
 	colorbar_stop_locked(cdev);
-	pci_clear_master(pdev);
 	colorbar_free_buffers_locked(cdev);
 	mutex_unlock(&cdev->lock);
 
 	if (cdev->bar)
-		pci_iounmap(pdev, cdev->bar);
+		iounmap(cdev->bar);
 
 	if (g_cdev == cdev)
 		g_cdev = NULL;
 
 	pci_release_region(pdev, cdev->bar_index);
+	pci_clear_master(pdev);
 	pci_disable_device(pdev);
 	kfree(cdev);
 }
@@ -438,7 +542,11 @@ static int __init colorbar_init(void)
 	if (ret)
 		goto unregister_chrdev;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+	g_class = class_create(COLORBAR_CLASS_NAME);
+#else
 	g_class = class_create(THIS_MODULE, COLORBAR_CLASS_NAME);
+#endif
 	if (IS_ERR(g_class)) {
 		ret = PTR_ERR(g_class);
 		goto del_cdev;
@@ -454,7 +562,7 @@ static int __init colorbar_init(void)
 	if (ret)
 		goto destroy_device;
 
-	pr_info("colorbar PCIe RX driver loaded\n");
+	pr_info("colorbar PCIe RX driver loaded, new FPGA ARM/LEN/ADDR/START handshake, START gated by allow_dma_start\n");
 	return 0;
 
 destroy_device:
@@ -483,4 +591,4 @@ module_exit(colorbar_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("cat_pcie_project");
-MODULE_DESCRIPTION("RK3568 PCIe colorbar RGB565 receiver driver");
+MODULE_DESCRIPTION("RK3568 PCIe colorbar RGB565 receiver driver, rewritten toward verified Pango DMA style");

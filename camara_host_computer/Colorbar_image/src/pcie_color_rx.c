@@ -96,6 +96,21 @@ static int validate_buffer(const uint8_t *data, size_t size)
     return 0;
 }
 
+static void dump_prefix(const uint8_t *data, size_t size)
+{
+    size_t i;
+    size_t limit = size < 64 ? size : 64;
+
+    printf("first %zu byte(s):", limit);
+    for (i = 0; i < limit; i++) {
+        if ((i % 16) == 0) {
+            printf("\n  %04zx:", i);
+        }
+        printf(" %02x", data[i]);
+    }
+    printf("\n");
+}
+
 static int validate_file(const char *path)
 {
     int fd;
@@ -165,19 +180,33 @@ static int write_all(int fd, const uint8_t *data, size_t len)
     return 0;
 }
 
+static int read_full(int fd, uint8_t *data, size_t len)
+{
+    while (len > 0) {
+        ssize_t got = read(fd, data, len);
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (got == 0) {
+            errno = EIO;
+            return -1;
+        }
+        data += got;
+        len -= (size_t)got;
+    }
+    return 0;
+}
+
 static int capture_once(const char *device, const char *output)
 {
     int dev_fd = -1;
     int out_fd = -1;
-    uint8_t *buffers[COLORBAR_BUFFER_COUNT];
+    uint8_t *frame_data = NULL;
     struct colorbar_frame_info frame = {0};
-    const uint8_t *frame_data;
     int ret = -1;
-    unsigned int i;
-
-    for (i = 0; i < COLORBAR_BUFFER_COUNT; i++) {
-        buffers[i] = MAP_FAILED;
-    }
 
     dev_fd = open(device, O_RDWR);
     if (dev_fd < 0) {
@@ -191,19 +220,9 @@ static int capture_once(const char *device, const char *output)
         goto out;
     }
 
-    for (i = 0; i < COLORBAR_BUFFER_COUNT; i++) {
-        off_t offset = (off_t)i * COLORBAR_BUFFER_SIZE;
-        buffers[i] = mmap(NULL, COLORBAR_BUFFER_SIZE, PROT_READ | PROT_WRITE,
-                          MAP_SHARED, dev_fd, offset);
-        if (buffers[i] == MAP_FAILED) {
-            perror("mmap DMA buffer");
-            goto out_unmap;
-        }
-    }
-
     if (ioctl(dev_fd, COLORBAR_IOC_START) < 0) {
         perror("COLORBAR_IOC_START");
-        goto out_unmap;
+        goto out_free;
     }
 
     if (ioctl(dev_fd, COLORBAR_IOC_WAIT_FRAME, &frame) < 0) {
@@ -212,8 +231,24 @@ static int capture_once(const char *device, const char *output)
         goto out_stop;
     }
 
-    if (frame.buffer_index >= COLORBAR_BUFFER_COUNT) {
-        fprintf(stderr, "invalid frame buffer index: %u\n", frame.buffer_index);
+    if (frame.valid_size == 0 || frame.valid_size > COLORBAR_FRAME_SIZE) {
+        fprintf(stderr, "invalid frame valid_size: %u\n", frame.valid_size);
+        goto out_stop;
+    }
+
+    frame_data = malloc(frame.valid_size);
+    if (!frame_data) {
+        perror("malloc frame buffer");
+        goto out_stop;
+    }
+
+    if (lseek(dev_fd, 0, SEEK_SET) < 0) {
+        perror("lseek device");
+        goto out_stop;
+    }
+
+    if (read_full(dev_fd, frame_data, frame.valid_size) < 0) {
+        perror("read frame from driver");
         goto out_stop;
     }
 
@@ -223,15 +258,21 @@ static int capture_once(const char *device, const char *output)
         goto out_stop;
     }
 
-    frame_data = buffers[frame.buffer_index];
-    if (write_all(out_fd, frame_data, COLORBAR_FRAME_SIZE) < 0) {
+    if (write_all(out_fd, frame_data, frame.valid_size) < 0) {
         perror("write output");
         goto out_close_output;
     }
 
-    printf("captured frame_counter=%u buffer=%u to %s\n",
-           frame.frame_counter, frame.buffer_index, output);
-    ret = validate_buffer(frame_data, COLORBAR_FRAME_SIZE);
+    printf("captured frame_counter=%u buffer=%u bytes=%u to %s\n",
+           frame.frame_counter, frame.buffer_index, frame.valid_size, output);
+
+    if (frame.valid_size >= COLORBAR_FRAME_SIZE) {
+        ret = validate_buffer(frame_data, frame.valid_size);
+    } else {
+        dump_prefix(frame_data, frame.valid_size);
+        printf("partial DMA capture saved; skip full-frame colorbar validation\n");
+        ret = 0;
+    }
 
 out_close_output:
     if (out_fd >= 0) {
@@ -241,16 +282,12 @@ out_stop:
     if (ioctl(dev_fd, COLORBAR_IOC_STOP) < 0) {
         perror("COLORBAR_IOC_STOP");
     }
-out_unmap:
-    for (i = 0; i < COLORBAR_BUFFER_COUNT; i++) {
-        if (buffers[i] != MAP_FAILED) {
-            munmap(buffers[i], COLORBAR_BUFFER_SIZE);
-        }
-    }
+out_free:
     if (ioctl(dev_fd, COLORBAR_IOC_FREE_BUFS) < 0) {
         perror("COLORBAR_IOC_FREE_BUFS");
     }
 out:
+    free(frame_data);
     close(dev_fd);
     return ret;
 }
