@@ -148,11 +148,15 @@ static int capture_once(const char *device, const char *output)
 {
     int dev_fd = -1;
     int out_fd = -1;
-    uint8_t *buffers = MAP_FAILED;
-    size_t map_size = (size_t)COLORBAR_BUFFER_COUNT * COLORBAR_BUFFER_SIZE;
+    uint8_t *buffers[COLORBAR_BUFFER_COUNT];
     struct colorbar_frame_info frame = {0};
     const uint8_t *frame_data;
     int ret = -1;
+    unsigned int i;
+
+    for (i = 0; i < COLORBAR_BUFFER_COUNT; i++) {
+        buffers[i] = MAP_FAILED;
+    }
 
     dev_fd = open(device, O_RDWR);
     if (dev_fd < 0) {
@@ -166,10 +170,14 @@ static int capture_once(const char *device, const char *output)
         goto out;
     }
 
-    buffers = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, dev_fd, 0);
-    if (buffers == MAP_FAILED) {
-        perror("mmap DMA buffers");
-        goto out_free;
+    for (i = 0; i < COLORBAR_BUFFER_COUNT; i++) {
+        off_t offset = (off_t)i * COLORBAR_BUFFER_SIZE;
+        buffers[i] = mmap(NULL, COLORBAR_BUFFER_SIZE, PROT_READ | PROT_WRITE,
+                          MAP_SHARED, dev_fd, offset);
+        if (buffers[i] == MAP_FAILED) {
+            perror("mmap DMA buffer");
+            goto out_unmap;
+        }
     }
 
     if (ioctl(dev_fd, COLORBAR_IOC_START) < 0) {
@@ -194,7 +202,7 @@ static int capture_once(const char *device, const char *output)
         goto out_stop;
     }
 
-    frame_data = buffers + (size_t)frame.buffer_index * COLORBAR_BUFFER_SIZE;
+    frame_data = buffers[frame.buffer_index];
     if (write_all(out_fd, frame_data, COLORBAR_FRAME_SIZE) < 0) {
         perror("write output");
         goto out_close_output;
@@ -213,10 +221,11 @@ out_stop:
         perror("COLORBAR_IOC_STOP");
     }
 out_unmap:
-    if (buffers != MAP_FAILED) {
-        munmap(buffers, map_size);
+    for (i = 0; i < COLORBAR_BUFFER_COUNT; i++) {
+        if (buffers[i] != MAP_FAILED) {
+            munmap(buffers[i], COLORBAR_BUFFER_SIZE);
+        }
     }
-out_free:
     if (ioctl(dev_fd, COLORBAR_IOC_FREE_BUFS) < 0) {
         perror("COLORBAR_IOC_FREE_BUFS");
     }

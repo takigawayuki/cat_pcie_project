@@ -1,4 +1,13 @@
 build/
+driver/*.o
+driver/*.ko
+driver/*.mod
+driver/*.mod.c
+driver/.*.cmd
+driver/.*.d
+driver/.tmp_versions/
+driver/Module.symvers
+driver/modules.order
 *.rgb565
 *.raw
 *.ppm

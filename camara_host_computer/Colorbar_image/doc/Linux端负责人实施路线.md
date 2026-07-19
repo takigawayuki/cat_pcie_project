@@ -388,3 +388,75 @@ SDL/Qt GUI
 ## 10. 一句话结论
 
 `pango_pcie_dma_alloc` 已经证明 PCIe 和基础 DMA 通了；`camara_host_computer` 应该作为新的 Linux 图像接收工程，第一步不是做漂亮界面，而是做 **4 个 4MB 级 DMA buffer + mmap + 保存 RGB565 raw + 抽样校验彩条**。
+
+
+## 11. 当前实现进度更新
+
+当前 `camara_host_computer/Colorbar_image` 已经新增了独立 Linux 端接收骨架和驱动：
+
+```text
+include/colorbar_pcie_rx.h
+src/pcie_color_rx.c
+driver/colorbar_pcie_driver.c
+driver/colorbar_pcie_driver.h
+driver/Makefile
+Makefile
+```
+
+新驱动设备节点：
+
+```text
+/dev/colorbar_pcie_rx
+```
+
+新驱动当前已经实现：
+
+```text
+匹配 0755:0755 PCIe Endpoint
+默认映射 BAR1，可通过 insmod bar=0/1 调整
+强制 32-bit DMA mask
+分配 4 个 DMA coherent buffer
+每个 buffer 大小 4,149,248 bytes
+mmap 映射每个 DMA buffer 给用户态
+启动时连续 4 次写 BAR+0x110
+停止时写 BAR+0x130
+临时用 frame_wait_ms 固定延时模拟等待一帧
+```
+
+编译：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+make
+```
+
+已验证可以生成：
+
+```text
+build/pcie_color_rx
+driver/colorbar_pcie_driver.ko
+```
+
+上板测试建议：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo rmmod pango_pci_driver 2>/dev/null || true
+sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 frame_wait_ms=100
+ls -l /dev/colorbar_pcie_rx
+dmesg | tail -n 120
+sudo ./build/pcie_color_rx --once --output frame_0000.rgb565
+./build/pcie_color_rx --validate frame_0000.rgb565
+```
+
+如果没有 probe，说明旧驱动仍绑定设备，或者 Vendor/Device ID 不匹配。
+
+如果 probe 成功但保存的 raw 校验失败，优先调整：
+
+```text
+bar=0 或 bar=1
+addr_byteswap=1 或 addr_byteswap=0
+frame_wait_ms=50/100/200
+```
+
+当前最大风险仍然是 FPGA 没有 frame_done 状态寄存器，所以 `COLORBAR_IOC_WAIT_FRAME` 目前只能用固定延时估算。数据跑通后，下一步应让 FPGA 端提供 frame_counter/current_page/fifo_overflow 状态寄存器，或者中断。

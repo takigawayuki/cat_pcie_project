@@ -1,10 +1,19 @@
-#ifndef COLORBAR_PCIE_RX_H
-#define COLORBAR_PCIE_RX_H
+#ifndef COLORBAR_PCIE_DRIVER_H
+#define COLORBAR_PCIE_DRIVER_H
 
-#include <stdint.h>
-#include <sys/ioctl.h>
+#include <linux/ioctl.h>
+#include <linux/mm.h>
+#include <linux/types.h>
 
-#define COLORBAR_DEVICE_PATH "/dev/colorbar_pcie_rx"
+#define COLORBAR_PCI_VENDOR_ID 0x0755
+#define COLORBAR_PCI_DEVICE_ID 0x0755
+
+#define COLORBAR_DEVICE_NAME "colorbar_pcie_rx"
+#define COLORBAR_CLASS_NAME "colorbar_pcie"
+
+#define COLORBAR_BAR_DEFAULT 1
+#define COLORBAR_REG_DMA_ADDR 0x110
+#define COLORBAR_REG_DMA_STOP 0x130
 
 #define COLORBAR_WIDTH 1920u
 #define COLORBAR_HEIGHT 1080u
@@ -12,27 +21,25 @@
 #define COLORBAR_FRAME_SIZE (COLORBAR_WIDTH * COLORBAR_HEIGHT * COLORBAR_BYTES_PER_PIXEL)
 #define COLORBAR_MARK_SIZE 64u
 #define COLORBAR_BUFFER_COUNT 4u
-#define COLORBAR_PAGE_SIZE 4096u
-#define COLORBAR_BUFFER_SIZE (((COLORBAR_FRAME_SIZE + COLORBAR_MARK_SIZE + COLORBAR_PAGE_SIZE - 1u) / COLORBAR_PAGE_SIZE) * COLORBAR_PAGE_SIZE)
-
 #define COLORBAR_FORMAT_RGB565 0x00005651u
+#define COLORBAR_BUFFER_SIZE PAGE_ALIGN(COLORBAR_FRAME_SIZE + COLORBAR_MARK_SIZE)
 
 #define COLORBAR_IOCTL_MAGIC 'C'
 
 struct colorbar_rx_info {
-    uint32_t width;
-    uint32_t height;
-    uint32_t format;
-    uint32_t buffer_count;
-    uint32_t frame_size;
-    uint32_t buffer_size;
+	__u32 width;
+	__u32 height;
+	__u32 format;
+	__u32 buffer_count;
+	__u32 frame_size;
+	__u32 buffer_size;
 };
 
 struct colorbar_frame_info {
-    uint32_t buffer_index;
-    uint32_t frame_counter;
-    uint32_t valid_size;
-    uint32_t flags;
+	__u32 buffer_index;
+	__u32 frame_counter;
+	__u32 valid_size;
+	__u32 flags;
 };
 
 #define COLORBAR_IOC_GET_INFO _IOR(COLORBAR_IOCTL_MAGIC, 0x00, struct colorbar_rx_info)
