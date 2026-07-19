@@ -31,6 +31,9 @@ fi
 if ! has_param dma_len_bytes "$@"; then
     PARAMS="$PARAMS dma_len_bytes=64"
 fi
+if ! has_param verify_readback "$@"; then
+    PARAMS="$PARAMS verify_readback=1"
+fi
 
 if [ ! -f "$KO" ]; then
     echo "driver ko not found: $KO" >&2
