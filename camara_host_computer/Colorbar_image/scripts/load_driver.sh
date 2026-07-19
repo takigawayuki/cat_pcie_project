@@ -28,6 +28,9 @@ fi
 if ! has_param frame_wait_ms "$@"; then
     PARAMS="$PARAMS frame_wait_ms=100"
 fi
+if ! has_param dma_len_bytes "$@"; then
+    PARAMS="$PARAMS dma_len_bytes=64"
+fi
 
 if [ ! -f "$KO" ]; then
     echo "driver ko not found: $KO" >&2

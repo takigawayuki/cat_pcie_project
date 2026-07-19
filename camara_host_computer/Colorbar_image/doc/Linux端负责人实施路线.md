@@ -207,10 +207,11 @@ camara_host_computer/Colorbar_image/scripts/load_driver.sh
 bar=1
 addr_byteswap=1
 frame_wait_ms=100
+dma_len_bytes=64
 allow_dma_start=0
 ```
 
-默认加载不会启动 DMA。
+默认加载不会启动 DMA，并且默认只按 64B 测试长度准备 DMA buffer，避免在安全验证阶段申请全帧大块 coherent 内存。
 
 ## 2026-07-19：当前安全测试完整命令
 
@@ -341,10 +342,11 @@ Region 1 存在，当前脚本默认使用 bar=1
 bar=1
 addr_byteswap=1
 frame_wait_ms=100
+dma_len_bytes=64
 allow_dma_start=0
 ```
 
-因此它不会允许 `START` 真正启动 DMA。
+因此它不会允许 `START` 真正启动 DMA，并且只会按 64B 测试长度准备 DMA buffer。
 
 确认设备节点：
 
@@ -427,6 +429,24 @@ ls -lh /tmp/should_not_start.bin
 如果提示文件不存在，也是正常的。
 
 这一步不会真正启动 DMA，风险低。
+
+如果看到下面这种输出：
+
+```text
+COLORBAR_IOC_ALLOC_BUFS: Cannot allocate memory
+```
+
+含义是驱动在申请 DMA coherent buffer 时失败，还没有走到 START，也没有启动 FPGA DMA。原因通常是当前加载的旧驱动或旧脚本仍按全帧大小一次申请 4 个大 buffer。处理方法是重新编译并重新加载当前新版本：
+
+```sh
+make clean
+make
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+./scripts/load_driver.sh dma_len_bytes=64
+sudo ./build/pcie_color_rx --once --output /tmp/should_not_start.bin
+```
+
+重新加载后，如果安全闸门正常，应看到 `Operation not permitted`，而不是 `Cannot allocate memory`。
 
 ### 6. 64B 真实 DMA 小步测试
 
@@ -600,7 +620,7 @@ sudo dmesg | tail -n 80
 ```text
 make clean / make                                      风险低，不碰 DMA
 lspci / cat resource                                   风险低，只查询 PCIe
-./scripts/load_driver.sh                               风险低，默认 allow_dma_start=0
+./scripts/load_driver.sh                               风险低，默认 allow_dma_start=0，dma_len_bytes=64
 --safe-stop                                            风险低，只 STOP/清状态
 --once 且 allow_dma_start=0                             风险低，应该被拒绝
 allow_dma_start=1 dma_len_bytes=64 + --once             有真实 DMA 风险，但长度最小

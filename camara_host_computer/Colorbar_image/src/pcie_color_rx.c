@@ -216,7 +216,7 @@ static int capture_once(const char *device, const char *output)
 
     if (ioctl(dev_fd, COLORBAR_IOC_ALLOC_BUFS) < 0) {
         perror("COLORBAR_IOC_ALLOC_BUFS");
-        fprintf(stderr, "the currently loaded driver probably does not implement Colorbar RX ioctls yet\n");
+        fprintf(stderr, "DMA buffer allocation failed; reload the driver with a smaller dma_len_bytes, for example: ./scripts/load_driver.sh dma_len_bytes=64\n");
         goto out;
     }
 

@@ -29,6 +29,7 @@ struct colorbar_device {
 	bool bufs_allocated;
 	bool started;
 	bool frame_ready;
+	size_t buffer_size;
 	u32 frame_counter;
 	u32 last_buffer_index;
 };
@@ -55,13 +56,26 @@ static bool block_unsafe_dma;
 module_param(block_unsafe_dma, bool, 0644);
 MODULE_PARM_DESC(block_unsafe_dma, "legacy emergency block switch; keep false for new ARM/LEN/START FPGA protocol");
 
-static uint dma_len_bytes = COLORBAR_FRAME_SIZE;
+static uint dma_len_bytes = 64;
 module_param(dma_len_bytes, uint, 0644);
-MODULE_PARM_DESC(dma_len_bytes, "requested DMA byte length: use 64, 4096, then full frame for staged validation");
+MODULE_PARM_DESC(dma_len_bytes, "requested DMA byte length: default 64 for safe staged validation; use 4096 then full frame explicitly");
 
 static uint frame_wait_ms = 100;
 module_param(frame_wait_ms, uint, 0644);
 MODULE_PARM_DESC(frame_wait_ms, "temporary wait time for one frame until FPGA frame-done status is available");
+
+static bool colorbar_dma_len_valid(void)
+{
+	return dma_len_bytes != 0 && dma_len_bytes <= COLORBAR_FRAME_SIZE;
+}
+
+static size_t colorbar_requested_buffer_size(void)
+{
+	if (!colorbar_dma_len_valid())
+		return 0;
+
+	return (size_t)PAGE_ALIGN(dma_len_bytes);
+}
 
 static int colorbar_set_dma_mask(struct pci_dev *pdev)
 {
@@ -86,14 +100,17 @@ static int colorbar_set_dma_mask(struct pci_dev *pdev)
 
 static void colorbar_free_buffers_locked(struct colorbar_device *cdev)
 {
+	size_t buffer_size = cdev->buffer_size;
 	int i;
 
-	if (!cdev->bufs_allocated)
-		return;
+	if (!buffer_size)
+		buffer_size = colorbar_requested_buffer_size();
+	if (!buffer_size)
+		buffer_size = COLORBAR_BUFFER_SIZE;
 
 	for (i = 0; i < COLORBAR_BUFFER_COUNT; i++) {
 		if (cdev->bufs[i].cpu_addr) {
-			pci_free_consistent(cdev->pdev, COLORBAR_BUFFER_SIZE,
+			pci_free_consistent(cdev->pdev, buffer_size,
 					    cdev->bufs[i].cpu_addr,
 					    cdev->bufs[i].dma_addr);
 			cdev->bufs[i].cpu_addr = NULL;
@@ -102,6 +119,7 @@ static void colorbar_free_buffers_locked(struct colorbar_device *cdev)
 	}
 
 	cdev->bufs_allocated = false;
+	cdev->buffer_size = 0;
 	cdev->started = false;
 	cdev->frame_ready = false;
 	cdev->frame_counter = 0;
@@ -110,14 +128,27 @@ static void colorbar_free_buffers_locked(struct colorbar_device *cdev)
 
 static int colorbar_alloc_buffers_locked(struct colorbar_device *cdev)
 {
+	size_t buffer_size = colorbar_requested_buffer_size();
 	int i;
 
-	if (cdev->bufs_allocated)
-		return 0;
+	if (!buffer_size) {
+		dev_err(&cdev->pdev->dev,
+			"refuse to allocate DMA buffers: invalid dma_len_bytes=%u, max=%u\n",
+			dma_len_bytes, COLORBAR_FRAME_SIZE);
+		return -EINVAL;
+	}
+
+	if (cdev->bufs_allocated) {
+		if (cdev->buffer_size == buffer_size)
+			return 0;
+		colorbar_free_buffers_locked(cdev);
+	}
+
+	cdev->buffer_size = buffer_size;
 
 	for (i = 0; i < COLORBAR_BUFFER_COUNT; i++) {
 		cdev->bufs[i].cpu_addr = pci_alloc_consistent(cdev->pdev,
-							 COLORBAR_BUFFER_SIZE,
+							 buffer_size,
 							 &cdev->bufs[i].dma_addr);
 		if (!cdev->bufs[i].cpu_addr)
 			goto fail;
@@ -129,10 +160,10 @@ static int colorbar_alloc_buffers_locked(struct colorbar_device *cdev)
 			goto fail;
 		}
 
-		memset(cdev->bufs[i].cpu_addr, 0, COLORBAR_BUFFER_SIZE);
-		dev_info(&cdev->pdev->dev, "buffer%d cpu=%p dma=%pad size=%u\n",
+		memset(cdev->bufs[i].cpu_addr, 0, buffer_size);
+		dev_info(&cdev->pdev->dev, "buffer%d cpu=%p dma=%pad size=%zu requested_len=%u\n",
 			 i, cdev->bufs[i].cpu_addr, &cdev->bufs[i].dma_addr,
-			 COLORBAR_BUFFER_SIZE);
+			 buffer_size, dma_len_bytes);
 	}
 
 	cdev->bufs_allocated = true;
@@ -195,9 +226,6 @@ static int colorbar_start_locked(struct colorbar_device *cdev)
 {
 	int i;
 
-	if (!cdev->bufs_allocated)
-		return -EINVAL;
-
 	if (block_unsafe_dma) {
 		dev_err(&cdev->pdev->dev,
 			"refuse to start FPGA DMA: Pango-style rewrite keeps colorbar stream blocked until protocol is revalidated\n");
@@ -210,10 +238,20 @@ static int colorbar_start_locked(struct colorbar_device *cdev)
 		return -EPERM;
 	}
 
-	if (dma_len_bytes == 0 || dma_len_bytes > COLORBAR_FRAME_SIZE) {
+	if (!colorbar_dma_len_valid()) {
 		dev_err(&cdev->pdev->dev,
 			"refuse to start FPGA DMA: invalid dma_len_bytes=%u, max=%u\n",
 			dma_len_bytes, COLORBAR_FRAME_SIZE);
+		return -EINVAL;
+	}
+
+	if (!cdev->bufs_allocated)
+		return -EINVAL;
+
+	if (cdev->buffer_size < colorbar_requested_buffer_size()) {
+		dev_err(&cdev->pdev->dev,
+			"refuse to start FPGA DMA: allocated buffer_size=%zu is smaller than requested len=%u\n",
+			cdev->buffer_size, dma_len_bytes);
 		return -EINVAL;
 	}
 
@@ -221,7 +259,7 @@ static int colorbar_start_locked(struct colorbar_device *cdev)
 	colorbar_hw_safe_stop(cdev);
 
 	for (i = 0; i < COLORBAR_BUFFER_COUNT; i++)
-		memset(cdev->bufs[i].cpu_addr, 0, COLORBAR_BUFFER_SIZE);
+		memset(cdev->bufs[i].cpu_addr, 0, cdev->buffer_size);
 
 	colorbar_write_cmd32(cdev, COLORBAR_DMA_ARM_MAGIC, COLORBAR_REG_DMA_ARM);
 	colorbar_write_cmd32(cdev, dma_len_bytes, COLORBAR_REG_DMA_LEN);
@@ -270,7 +308,7 @@ static long colorbar_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 		info.format = COLORBAR_FORMAT_RGB565;
 		info.buffer_count = COLORBAR_BUFFER_COUNT;
 		info.frame_size = COLORBAR_FRAME_SIZE;
-		info.buffer_size = COLORBAR_BUFFER_SIZE;
+		info.buffer_size = colorbar_requested_buffer_size();
 		if (copy_to_user((void __user *)arg, &info, sizeof(info)))
 			return -EFAULT;
 		return 0;
