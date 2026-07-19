@@ -193,6 +193,17 @@ static u32 colorbar_ioread32(struct colorbar_device *cdev, u32 offset)
 	return ioread32(cdev->bar + offset);
 }
 
+static u32 colorbar_read_cmd32(struct colorbar_device *cdev, u32 offset)
+{
+	u32 raw = colorbar_ioread32(cdev, offset);
+	u32 value = swab32(raw);
+
+	dev_info(&cdev->pdev->dev,
+		 "read DMA command: offset=0x%03x raw=0x%08x value=0x%08x\n",
+		 offset, raw, value);
+	return value;
+}
+
 static void colorbar_write_cmd32(struct colorbar_device *cdev, u32 value, u32 offset)
 {
 	u32 written = swab32(value);
@@ -230,10 +241,10 @@ static int colorbar_verify_readback_locked(struct colorbar_device *cdev)
 
 	for (i = 0; i < COLORBAR_BUFFER_COUNT; i++) {
 		u32 expected = lower_32_bits(cdev->bufs[i].dma_addr);
-		u32 got = colorbar_ioread32(cdev, echo_regs[i]);
+		u32 got = colorbar_read_cmd32(cdev, echo_regs[i]);
 
 		dev_info(&cdev->pdev->dev,
-			 "read ADDR_ECHO%d: got=0x%08x expected=0x%08x\n",
+			 "read ADDR_ECHO%d decoded=0x%08x expected=0x%08x\n",
 			 i, got, expected);
 
 		if (got != expected) {
@@ -244,7 +255,7 @@ static int colorbar_verify_readback_locked(struct colorbar_device *cdev)
 		}
 	}
 
-	status = colorbar_ioread32(cdev, COLORBAR_REG_DMA_STATUS);
+	status = colorbar_read_cmd32(cdev, COLORBAR_REG_DMA_STATUS);
 	dev_info(&cdev->pdev->dev,
 		 "read STATUS before START: 0x%08x busy=%u done=%u addr_error=%u arm=%u start=%u pcie_dma_enable=%u rc_cfg_ep=%u\n",
 		 status, !!(status & COLORBAR_STATUS_BUSY),
@@ -318,7 +329,12 @@ static int colorbar_start_locked(struct colorbar_device *cdev)
 		return -EINVAL;
 	}
 
+	/* PCIE_DMA_safe_test_4 gates command decoding with cfg_bus_master_en. */
 	pci_clear_master(cdev->pdev);
+	wmb();
+	pci_set_master(cdev->pdev);
+	wmb();
+	udelay(10);
 	colorbar_hw_safe_stop(cdev);
 
 	for (i = 0; i < COLORBAR_BUFFER_COUNT; i++)
@@ -334,11 +350,12 @@ static int colorbar_start_locked(struct colorbar_device *cdev)
 	wmb();
 	pci_set_master(cdev->pdev);
 	wmb();
+	udelay(10);
 
 	ret = colorbar_verify_readback_locked(cdev);
 	if (ret) {
-		pci_clear_master(cdev->pdev);
 		colorbar_hw_safe_stop(cdev);
+		pci_clear_master(cdev->pdev);
 		return ret;
 	}
 
@@ -358,8 +375,12 @@ static int colorbar_start_locked(struct colorbar_device *cdev)
 
 static void colorbar_stop_locked(struct colorbar_device *cdev)
 {
-	pci_clear_master(cdev->pdev);
+	/* The FPGA command decoder is gated by pcie_dma_enable, so send STOP before closing BusMaster. */
+	pci_set_master(cdev->pdev);
+	wmb();
+	udelay(10);
 	colorbar_hw_safe_stop(cdev);
+	pci_clear_master(cdev->pdev);
 }
 
 static long colorbar_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
@@ -581,7 +602,12 @@ static int colorbar_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	}
 
 	pci_clear_master(pdev);
+	wmb();
+	pci_set_master(pdev);
+	wmb();
+	udelay(10);
 	colorbar_hw_safe_stop(cdev);
+	pci_clear_master(pdev);
 
 	pci_set_drvdata(pdev, cdev);
 	g_cdev = cdev;

@@ -700,6 +700,190 @@ dmesg 出现 kernel oops、SError、PCIe AER 异常
 
 后续 FPGA 如果把 STATUS 做成可读寄存器，Linux 驱动应改为轮询 `frame_done_flag`，不要长期依赖固定延时。
 
+
+
+## 2026-07-20：PCIE_DMA_safe_test_4 ADDR_ECHO0 为 0 的修正
+
+### 1. 本次现象
+
+执行：
+
+```sh
+sudo ./build/pcie_color_rx --once --output /tmp/frame_64_test4.bin
+```
+
+返回：
+
+```text
+COLORBAR_IOC_START: Input/output error
+```
+
+dmesg 关键日志：
+
+```text
+program DMA command: offset=0x100 value=0xa55a5aa5 written=0xa55a5aa5
+program DMA command: offset=0x108 value=0x00000040 written=0x40000000
+program DMA address: dma=0x00000000eec03000 low32=0xeec03000 written=0x0030c0ee addr_byteswap=1
+read ADDR_ECHO0: got=0x00000000 expected=0xeec03000
+refuse to start FPGA DMA: ADDR_ECHO0 mismatch
+```
+
+这次不是系统崩溃，也不是 DMA 已经写坏内存。恰恰相反，是 Linux 驱动的保护生效：读回地址不一致，所以驱动拒绝写 `START=1`。
+
+### 2. 原因分析
+
+`PCIE_DMA_safe_test_4/source/pcie_dma_ctrl.v` 里命令解析逻辑受这个条件影响：
+
+```text
+pcie_dma_enable = cfg_bus_master_en && smlh_link_up && rdlh_link_up
+```
+
+并且在命令解析 always 块里：
+
+```verilog
+if(!rstn || !pcie_dma_enable || dma_stop_flag) begin
+    dma_addr0 <= 0;
+    dma_addr1 <= 0;
+    dma_addr2 <= 0;
+    dma_addr3 <= 0;
+    host_arm_flag <= 0;
+    host_start_flag <= 0;
+    dma_len_bytes <= 0;
+end
+```
+
+也就是说，如果 Linux 在 BusMaster 关闭时写 `ARM/LEN/ADDR`，FPGA 端会因为 `pcie_dma_enable=0` 处于清零/复位状态，这些命令不会被保存。所以读 `ADDR_ECHO0` 时得到 0。
+
+### 3. Linux 驱动修正
+
+已修正 `colorbar_pcie_driver.c`：
+
+```text
+旧顺序：
+关闭 BusMaster -> 写 STOP/ARM/LEN/ADDR -> 打开 BusMaster -> 读 ADDR_ECHO -> START
+
+新顺序：
+关闭 BusMaster -> 打开 BusMaster -> 等待 10us -> STOP 清状态 -> ARM -> LEN -> ADDR x4 -> 读 ADDR_ECHO/STATUS -> START
+```
+
+STOP 路径也已修正：
+
+```text
+旧顺序：
+关闭 BusMaster -> STOP
+
+新顺序：
+打开 BusMaster -> 等待 10us -> STOP -> 关闭 BusMaster
+```
+
+这样做的原因：当前 FPGA 版本要求 `pcie_dma_enable=1` 时才接收 host 写入命令。安全性来自 `ARM/START` 显式握手：打开 BusMaster 后，如果没有写合法 START，FPGA 不应该主动 DMA。
+
+### 4. 现在重新测试命令
+
+先重新加载新驱动：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo rmmod colorbar_pcie_driver
+./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=64
+```
+
+再执行 64B：
+
+```sh
+sudo ./build/pcie_color_rx --once --output /tmp/frame_64_test4_retry.bin
+```
+
+查看结果：
+
+```sh
+ls -lh /tmp/frame_64_test4_retry.bin
+hexdump -C /tmp/frame_64_test4_retry.bin | head
+sudo dmesg | tail -n 180
+```
+
+预期：
+
+```text
+ADDR_ECHO0..3 的 got 应该等于 expected
+STATUS before START 不应该显示 addr_error=1
+START written=0x01000000
+/tmp/frame_64_test4_retry.bin 大小为 64 字节
+hexdump 应该看到 A5A50000..A5A5000F 相关固定测试数据
+```
+
+如果仍然 `ADDR_ECHO0 got=0`，说明 FPGA 端 MRd/CplD 读回路径或命令保存路径还没有真正工作，继续禁止 4KB/全帧。
+
+
+
+## 2026-07-20：ADDR_ECHO 读回字节序修正
+
+### 1. 本次现象
+
+重新调整 BusMaster 顺序后，`ADDR_ECHO0` 已经不再是 0，而是：
+
+```text
+read ADDR_ECHO0: got=0x0030c0ee expected=0xeec03000
+```
+
+这说明 FPGA 已经收到并保存了 Linux 写入的地址，只是读回到 Linux 时仍然带着 FPGA CplD 数据通道的字节反转。
+
+Linux 写入地址时：
+
+```text
+expected low32 = 0xeec03000
+written        = 0x0030c0ee
+```
+
+FPGA ADDR_ECHO 原始读回：
+
+```text
+raw = 0x0030c0ee
+```
+
+Linux 需要再做一次 `swab32(raw)`，才能得到：
+
+```text
+value = 0xeec03000
+```
+
+### 2. Linux 驱动修正
+
+已新增读回解码：
+
+```text
+colorbar_read_cmd32()
+raw = ioread32(BAR + offset)
+value = swab32(raw)
+```
+
+现在 `ADDR_ECHO0..3` 和 `STATUS` 都按解码后的 `value` 判断。
+
+### 3. 重新测试命令
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo rmmod colorbar_pcie_driver
+./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=64
+sudo ./build/pcie_color_rx --once --output /tmp/frame_64_test4_readfix.bin
+ls -lh /tmp/frame_64_test4_readfix.bin
+hexdump -C /tmp/frame_64_test4_readfix.bin | head
+sudo dmesg | tail -n 200
+```
+
+这次预期日志应该看到：
+
+```text
+read DMA command: offset=0x114 raw=0x0030c0ee value=0xeec03000
+read ADDR_ECHO0 decoded=0xeec03000 expected=0xeec03000
+read ADDR_ECHO1 decoded=... expected=...
+read ADDR_ECHO2 decoded=... expected=...
+read ADDR_ECHO3 decoded=... expected=...
+program DMA command: offset=0x104 value=0x00000001 written=0x01000000
+```
+
+如果这些都通过，才说明 START 真正写出去了。随后看 `/tmp/frame_64_test4_readfix.bin` 是否是 64 字节，并且是否出现 `A5A50000..A5A5000F` 规律数据。
+
 ## 2026-07-19：如果还是异常，下一步查什么
 
 如果 64B 都异常，不要测 4KB 或全帧，直接查下面几项。
