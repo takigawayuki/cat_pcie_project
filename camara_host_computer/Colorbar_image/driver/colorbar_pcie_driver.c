@@ -209,9 +209,10 @@ static u32 colorbar_read_status_locked(struct colorbar_device *cdev, const char 
 	u32 status = colorbar_ioread32(cdev, COLORBAR_REG_DMA_STATUS);
 
 	dev_info(&cdev->pdev->dev,
-		 "read STATUS %s: 0x%08x busy=%u done=%u addr_error=%u arm=%u start=%u pcie_dma_enable=%u rc_cfg_ep=%u\n",
+		 "read STATUS %s: 0x%08x busy=%u done=%u start_cmd_seen=%u addr_error=%u arm=%u start=%u pcie_dma_enable=%u rc_cfg_ep=%u\n",
 		 phase, status, !!(status & COLORBAR_STATUS_BUSY),
 		 !!(status & COLORBAR_STATUS_FRAME_DONE),
+		 !!(status & COLORBAR_STATUS_START_CMD_SEEN),
 		 !!(status & COLORBAR_STATUS_ADDR_ERROR),
 		 !!(status & COLORBAR_STATUS_HOST_ARM),
 		 !!(status & COLORBAR_STATUS_HOST_START),

@@ -1421,3 +1421,300 @@ hexdump -C /tmp/frame_64_cd_prefill.bin | head
 sudo dmesg | tail -n 220
 ```
 
+
+## 2026-07-20：关于 Linux 预填 buffer 是否会影响 FPGA 写入
+
+### 1. 结论
+
+Linux 预填 DMA buffer 不会阻止 FPGA 写入。
+
+预填值只是调试用的“背景值”或“哨兵值”，用来判断 FPGA DMA 是否真的改写了这段 host buffer。它不参与 PCIe DMA 协议，也不会锁住这段内存。
+
+当前判断逻辑是：
+
+```text
+Linux 先把 DMA buffer 填成 0xCD。
+FPGA 如果真的对这个 DMA 地址发 MWr，buffer 内容会被 FPGA 数据覆盖。
+如果测试后仍然全是 cd cd cd cd，说明 FPGA 没有写进来，或者 START/MWr 没真正发生。
+```
+
+### 2. 能不能不预填
+
+技术上可以不预填，但调试时不推荐。
+
+不预填时，buffer 里可能是：
+
+```text
+全 00
+旧数据
+上一次测试残留
+内核分配出来时的已有内容
+```
+
+这样会导致结果很难判断。例如看到全 00 时，无法确认是 FPGA 写了 0，还是 FPGA 根本没写、buffer 原本就是 0。
+
+预填 `0xCD` 的目的就是让“没有写入”的状态非常明显：
+
+```text
+全 cd：没被 FPGA 改写。
+不是全 cd，并且出现 A5A50000..A5A5000F：FPGA 64B fixed_test_mode 写入成功。
+部分 cd、部分固定数据：可能是 TLP 长度、byte enable、TLAST 或 MWr 组包问题。
+```
+
+### 3. 为什么不把预填值设成 FPGA 固定测试值
+
+不要把 Linux 预填值设成 FPGA 将要发送的固定测试值。
+
+FPGA 64B fixed_test_mode 期望写入：
+
+```text
+A5A50000, A5A50001, ..., A5A5000F
+```
+
+如果 Linux 也提前填类似 `0xA5`，就会让“FPGA 真写了”和“FPGA 没写，buffer 只是原本就是 A5”混在一起，判断不清。
+
+所以当前 Linux 预填 `0xCD` 更合适。
+
+### 4. 当前主要问题集中在哪里
+
+根据最新日志：
+
+```text
+ADDR_ECHO0..3 decoded=expected
+read STATUS before START: 0x00000050 busy=0 done=0 addr_error=0 arm=1 start=0 pcie_dma_enable=1 rc_cfg_ep=0
+program DMA command: offset=0x104 value=0x00000001 written=0x01000000
+read STATUS after wait before STOP: 0x00000050 busy=0 done=0 addr_error=0 arm=1 start=0 pcie_dma_enable=1 rc_cfg_ep=0
+```
+
+这说明：
+
+```text
+ARM 已经生效。
+pcie_dma_enable 已经生效。
+4 个 DMA 地址已经正确写入并读回。
+但 START 后 host_start_flag 仍然是 0。
+frame_done_flag 也仍然是 0。
+```
+
+因此当前主要问题不是 Linux buffer 预填值，而是：
+
+```text
+FPGA 没有确认接收到 START，或者 START 条件没有命中。
+```
+
+### 5. 当前最该查的 FPGA 信号
+
+FPGA 端 ILA 应优先抓 `0x104 START` 这次 host MWr。
+
+触发条件建议：
+
+```text
+cmd_reg_addr == 12'h104
+```
+
+重点看：
+
+```text
+cmd_reg_addr
+cmd_data
+tlp_fmt
+tlp_type
+tlp_lenght
+host_arm_flag
+dma_addr_valid
+dma_len_valid
+host_start_flag
+addr_error_flag
+pcie_dma_enable
+```
+
+START 写入时预期：
+
+```text
+cmd_reg_addr = 12'h104
+cmd_data = 32'h00000001
+tlp_lenght = 1
+host_arm_flag = 1
+dma_addr_valid = 1
+dma_len_valid = 1
+host_start_flag 变成 1
+addr_error_flag = 0
+```
+
+如果 `cmd_reg_addr == 12'h104` 没出现，说明 START 这次 BAR 写没有被 FPGA 解码到。
+
+如果 `cmd_reg_addr == 12'h104` 出现但 `cmd_data != 32'h00000001`，说明 START 数据 lane 或字节序可能不对。
+
+如果 `cmd_data == 32'h00000001` 但 `host_start_flag` 不变 1，重点查 `dma_addr_valid` 和 `dma_len_valid`。
+
+## 2026-07-20：PCIE_DMA_safe_test_5 对 Linux 侧的影响
+
+### 1. FPGA test_5 改动摘要
+
+当前 FPGA 参考工程更新为：
+
+```text
+PCIE_DMA_safe_test_5
+```
+
+FPGA 侧关键改动：
+
+```text
+START 不再只判断 cmd_data[0]
+START 改为判断 cmd_data != 32'd0
+STATUS bit2 新增 start_cmd_seen_flag
+```
+
+含义是：
+
+```text
+Linux 写 0x00000001 可以启动。
+Linux 因字节序写成 0x01000000，FPGA 也会认为是 START 请求。
+但前提仍然是 ARM 正确、ADDR 正确、LEN 正确。
+```
+
+所以这不是无条件放开 DMA，只是把 START 字节序差异兼容掉。
+
+### 2. Linux 侧需要改什么
+
+Linux 驱动不需要改 START 写法。
+
+仍然保持：
+
+```text
+LEN/START 通过 colorbar_write_cmd32() 写入。
+ADDR 默认 addr_byteswap=1。
+不要加 addr_byteswap=0。
+```
+
+Linux 侧只需要识别新的 STATUS bit2：
+
+```text
+bit0 busy
+bit1 frame_done
+bit2 start_cmd_seen
+bit3 addr_error
+bit4 host_arm
+bit5 host_start
+bit6 pcie_dma_enable
+bit7 rc_cfg_ep
+```
+
+当前 Linux 驱动已增加 `start_cmd_seen` 打印。
+
+### 3. test_5 下 STATUS 怎么判断
+
+烧录 test_5 后，重新做 64B 测试。
+
+如果还是：
+
+```text
+0x50
+```
+
+含义是：
+
+```text
+arm=1
+pcie_dma_enable=1
+start_cmd_seen=0
+host_start=0
+```
+
+说明 START 写命令没有被这份 RTL 看见。重点怀疑：烧错 bitstream、顶层没有用这版 `pcie_dma_ctrl.v`、BAR 写没有到达当前逻辑。
+
+如果变成类似：
+
+```text
+0x54
+```
+
+含义是：
+
+```text
+start_cmd_seen=1
+arm=1
+pcie_dma_enable=1
+host_start=0
+```
+
+说明 FPGA 已经看见 START 写入，但 START 条件没有完全通过。重点查：
+
+```text
+dma_addr_valid
+dma_len_valid
+addr_error_flag
+```
+
+如果变成类似：
+
+```text
+0x74
+```
+
+含义是：
+
+```text
+start_cmd_seen=1
+host_start=1
+arm=1
+pcie_dma_enable=1
+```
+
+说明 START 已经进到 FPGA，接下来要查 MWr 发送状态机：
+
+```text
+mwr_state
+AXIS_S_TVALID
+AXIS_S_TREADY
+AXIS_S_TLAST
+AXIS_S_TDATA
+```
+
+如果完成后看到：
+
+```text
+0x42
+```
+
+含义是：
+
+```text
+pcie_dma_enable=1
+frame_done=1
+```
+
+这是比较理想的完成状态。随后再看 `/tmp/frame_64.bin` 前 64 字节是否从 `cd cd cd...` 变成 FPGA fixed_test_mode 的固定数据。
+
+### 4. test_5 推荐测试命令
+
+确认 FPGA 已重新综合并烧录 `PCIE_DMA_safe_test_5` 后，Linux 端执行：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo make
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=64
+sudo ./build/pcie_color_rx --once --output /tmp/frame_64_test5.bin
+hexdump -C /tmp/frame_64_test5.bin | head
+sudo dmesg | tail -n 120
+```
+
+注意：
+
+```text
+不要加 addr_byteswap=0。
+不要直接测 4KB。
+不要直接测全帧。
+```
+
+只有 64B 下同时满足：
+
+```text
+start_cmd_seen=1
+addr_error=0
+frame_done=1 或者 host_start 曾经为 1
+hexdump 不再全是 cd
+```
+
+才进入 4KB 测试。
