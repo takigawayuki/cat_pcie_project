@@ -2315,3 +2315,119 @@ cd cd cd cd ...
 说明 FPGA DMA 数据没有真正写入 host buffer。
 
 如果系统稳定、文件大小正确、数据不是全 cd，再继续做 RGB565 彩条采样校验。
+
+## 2026-07-20：test_8 申请整帧 DMA buffer 失败后的修正
+
+### 1. 本次现象
+
+执行安全检查：
+
+```sh
+./scripts/load_driver.sh dma_len_bytes=4147264
+sudo ./build/pcie_color_rx --once --output /tmp/should_not_start_test8.bin
+```
+
+返回：
+
+```text
+COLORBAR_IOC_ALLOC_BUFS: Cannot allocate memory
+```
+
+这一步没有启动 DMA，因为失败发生在 `COLORBAR_IOC_ALLOC_BUFS`，还没有走到 `COLORBAR_IOC_START`。
+
+### 2. 原因
+
+旧 Linux 驱动仍按 4 个 DMA buffer 分配：
+
+```text
+4 * PAGE_ALIGN(4147264) = 4 * 4149248 = 16596992 bytes
+```
+
+RK3568 当前内核环境下，一次申请约 16.6MB coherent DMA 内存失败。
+
+FPGA test_8 当前强制整帧发送，主要使用 buffer0 地址承接整帧。为了降低内存压力，Linux 侧改为：
+
+```text
+COLORBAR_BUFFER_COUNT = 1
+```
+
+也就是只申请 1 个约 4.15MB 的 coherent buffer。
+
+### 3. 兼容 FPGA 四地址寄存器的做法
+
+虽然 Linux 只分配 1 个 buffer，但写 FPGA 地址寄存器时仍连续写 4 次：
+
+```text
+ADDR0 = buffer0
+ADDR1 = buffer0
+ADDR2 = buffer0
+ADDR3 = buffer0
+```
+
+这样做的目的：
+
+```text
+如果 FPGA test_8 只使用 buffer0，则正好匹配。
+如果 FPGA 仍然检查 4 个地址非 0，也不会因为 ADDR1..3 为 0 而失败。
+```
+
+ADDR_ECHO 读回也按 4 个寄存器检查，但期望值都等于 buffer0 地址。
+
+### 4. 新的安全检查命令
+
+重新编译：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo make
+```
+
+先加载但不允许 DMA：
+
+```sh
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+./scripts/load_driver.sh dma_len_bytes=4147264
+sudo ./build/pcie_color_rx --once --output /tmp/should_not_start_test8.bin
+sudo dmesg | tail -n 120
+```
+
+预期：
+
+```text
+COLORBAR_IOC_START: Operation not permitted
+```
+
+并且 dmesg 应看到：
+
+```text
+buffer0 ... size=4149248 requested_len=4147264
+```
+
+现在只应看到 `buffer0`，不再要求看到 buffer1..3。
+
+如果还是：
+
+```text
+COLORBAR_IOC_ALLOC_BUFS: Cannot allocate memory
+```
+
+说明连单个约 4.15MB coherent buffer 都申请失败，需要考虑预留 CMA、降低系统内存压力或改用不同 DMA 分配策略。
+
+### 5. 真实 test_8 DMA 命令
+
+只有安全检查确认 buffer0 分配成功后，才允许真实 DMA：
+
+```sh
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=4147264
+sudo ./build/pcie_color_rx --once --output /tmp/frame_full_test8.rgb565
+hexdump -C /tmp/frame_full_test8.rgb565 | head
+sudo dmesg | tail -n 160
+```
+
+仍然禁止使用：
+
+```sh
+./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=64
+./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=4096
+```

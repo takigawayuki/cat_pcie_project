@@ -248,7 +248,7 @@ static void colorbar_write_dma_addr(struct colorbar_device *cdev, dma_addr_t dma
 
 static int colorbar_verify_readback_locked(struct colorbar_device *cdev)
 {
-	static const u32 echo_regs[COLORBAR_BUFFER_COUNT] = {
+	static const u32 echo_regs[] = {
 		COLORBAR_REG_DMA_ADDR_ECHO0,
 		COLORBAR_REG_DMA_ADDR_ECHO1,
 		COLORBAR_REG_DMA_ADDR_ECHO2,
@@ -260,8 +260,8 @@ static int colorbar_verify_readback_locked(struct colorbar_device *cdev)
 	if (!verify_readback)
 		return 0;
 
-	for (i = 0; i < COLORBAR_BUFFER_COUNT; i++) {
-		u32 expected = lower_32_bits(cdev->bufs[i].dma_addr);
+	for (i = 0; i < ARRAY_SIZE(echo_regs); i++) {
+		u32 expected = lower_32_bits(cdev->bufs[i % COLORBAR_BUFFER_COUNT].dma_addr);
 		u32 got = colorbar_read_cmd32(cdev, echo_regs[i]);
 
 		dev_info(&cdev->pdev->dev,
@@ -296,7 +296,7 @@ static void colorbar_hw_safe_stop(struct colorbar_device *cdev)
 	colorbar_iowrite32(cdev, 0, COLORBAR_REG_DMA_START);
 	colorbar_iowrite32(cdev, 0, COLORBAR_REG_DMA_ARM);
 	colorbar_iowrite32(cdev, 0, COLORBAR_REG_DMA_LEN);
-	for (i = 0; i < COLORBAR_BUFFER_COUNT; i++)
+	for (i = 0; i < 4; i++)
 		colorbar_iowrite32(cdev, 0, COLORBAR_REG_DMA_ADDR);
 	wmb();
 	cdev->started = false;
@@ -356,8 +356,8 @@ static int colorbar_start_locked(struct colorbar_device *cdev)
 	colorbar_write_cmd32(cdev, dma_len_bytes, COLORBAR_REG_DMA_LEN);
 	wmb();
 
-	for (i = 0; i < COLORBAR_BUFFER_COUNT; i++)
-		colorbar_write_dma_addr(cdev, cdev->bufs[i].dma_addr);
+	for (i = 0; i < 4; i++)
+		colorbar_write_dma_addr(cdev, cdev->bufs[i % COLORBAR_BUFFER_COUNT].dma_addr);
 
 	wmb();
 	pci_set_master(cdev->pdev);
@@ -445,7 +445,7 @@ static long colorbar_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 			mutex_lock(&cdev->lock);
 
 			cdev->frame_counter++;
-			cdev->last_buffer_index = (cdev->frame_counter - 1) % COLORBAR_BUFFER_COUNT;
+			cdev->last_buffer_index = 0;
 			cdev->frame_ready = true;
 
 			frame.frame_counter = cdev->frame_counter;
