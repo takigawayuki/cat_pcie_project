@@ -984,7 +984,7 @@ pcie_dma_ctrl u_pcie_dam_ctrl(
  wire    [127:0]  axis_slave1_tdata;
  wire    [15: 0] pcie_data_out /* synthesis PAP_MARK_DEBUG="1" */;
 //assign    pcie_data_out =  r_de_out?{r_r_out,r_g_out,r_b_out,'hdd} : 'd0;
-assign    pcie_data_out =  video_enhance_de_out?{video_enhance_r_out[7:3],video_enhance_g_out[7:2],video_enhance_b_out[7:3]} : 'd0;
+assign    pcie_data_out =  r_de_out ? {r_r_out[7:3],r_g_out[7:2],r_b_out[7:3]} : 'd0;
 
 //----------------------------------------------------------rst debounce ----------------------------------------------------------
 //ASYNC RST  define IPSL_PCIE_SPEEDUP_SIM when simulation
