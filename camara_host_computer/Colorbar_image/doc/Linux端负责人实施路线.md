@@ -1718,3 +1718,419 @@ hexdump 不再全是 cd
 ```
 
 才进入 4KB 测试。
+
+## 2026-07-20：test_5 已确认 START 被 FPGA 看见，但 START 条件失败
+
+### 1. 本次日志
+
+本次 64B 测试关键日志：
+
+```text
+read ADDR_ECHO0 decoded=0xeec03000 expected=0xeec03000
+read ADDR_ECHO1 decoded=0xeec04000 expected=0xeec04000
+read ADDR_ECHO2 decoded=0xeec05000 expected=0xeec05000
+read ADDR_ECHO3 decoded=0xeec06000 expected=0xeec06000
+read STATUS before START: 0x00000050 busy=0 done=0 start_cmd_seen=0 addr_error=0 arm=1 start=0 pcie_dma_enable=1 rc_cfg_ep=0
+program DMA command: offset=0x104 value=0x00000001 written=0x01000000
+read STATUS after wait before STOP: 0x0000005c busy=0 done=0 start_cmd_seen=1 addr_error=1 arm=1 start=0 pcie_dma_enable=1 rc_cfg_ep=0
+```
+
+### 2. 结论
+
+这次已经可以排除“FPGA 完全没看到 START”。
+
+因为：
+
+```text
+start_cmd_seen=1
+```
+
+说明 FPGA 已经看到过 `0x104 START` 写入。
+
+但是：
+
+```text
+addr_error=1
+host_start/start=0
+frame_done/done=0
+```
+
+说明 FPGA 看见 START 后，没有进入 DMA 发送状态，而是判定 START 条件失败。
+
+对应 FPGA 逻辑是：
+
+```verilog
+if(cmd_start_request) begin
+    start_cmd_seen_flag <= 1'b1;
+    if(dma_addr_valid && dma_len_valid) begin
+        host_start_flag <= 1'b1;
+        frame_done_flag <= 1'b0;
+        addr_error_flag <= 1'b0;
+    end
+    else begin
+        host_start_flag <= 1'b0;
+        addr_error_flag <= 1'b1;
+    end
+end
+```
+
+所以当前问题集中在：
+
+```text
+dma_addr_valid && dma_len_valid 不成立
+```
+
+### 3. Linux 侧目前已经确认的部分
+
+Linux 侧已经看到：
+
+```text
+ADDR_ECHO0..3 全部 decoded=expected
+pcie_dma_enable=1
+ARM=1
+START 已被 FPGA 看见
+```
+
+这说明：
+
+```text
+BAR1 控制路径是通的。
+4 个 DMA 地址至少在 ADDR_ECHO 读回路径上是正确的。
+START 写命令已经进入 FPGA 当前 RTL。
+```
+
+因此当前不是“START 写不到 FPGA”的问题，也不是 Linux 默认安全闸门拦住的问题。
+
+### 4. 当前最可疑点
+
+当前最可疑的是 FPGA 内部在 START 判断那一拍看到：
+
+```text
+dma_len_valid = 0
+```
+
+或者：
+
+```text
+dma_addr_valid = 0
+```
+
+其中第一怀疑是 LEN 字节序或 LEN 保存值。
+
+Linux 日志显示：
+
+```text
+program DMA command: offset=0x108 value=0x00000040 written=0x40000000
+```
+
+Linux 想表达的 LEN 是 64 字节：
+
+```text
+0x00000040
+```
+
+如果 FPGA 内部 `cmd_data` 字节反转后正确，应保存为：
+
+```text
+dma_len_bytes = 32'h00000040
+```
+
+此时：
+
+```text
+dma_len_valid = 1
+```
+
+如果 FPGA 内部实际保存为：
+
+```text
+dma_len_bytes = 32'h40000000
+```
+
+则：
+
+```text
+dma_len_valid = 0
+```
+
+START 后就会出现当前看到的：
+
+```text
+start_cmd_seen=1
+addr_error=1
+host_start=0
+```
+
+### 5. 下一步 FPGA ILA 必抓信号
+
+让 FPGA 端 ILA 触发 `cmd_reg_addr == 12'h104`，也就是 START 写入那一拍。
+
+必须抓：
+
+```text
+cmd_reg_addr
+cmd_data
+cmd_start_request
+dma_len_bytes
+dma_len_valid
+dma_addr0
+dma_addr1
+dma_addr2
+dma_addr3
+dma_addr_valid
+host_arm_flag
+start_cmd_seen_flag
+host_start_flag
+addr_error_flag
+pcie_dma_enable
+```
+
+START 写入时理论期望：
+
+```text
+cmd_reg_addr = 12'h104
+cmd_data != 0
+cmd_start_request = 1
+dma_len_bytes = 32'h00000040
+dma_len_valid = 1
+dma_addr0 = 32'heec03000
+dma_addr1 = 32'heec04000
+dma_addr2 = 32'heec05000
+dma_addr3 = 32'heec06000
+dma_addr_valid = 1
+host_arm_flag = 1
+addr_error_flag = 0
+host_start_flag = 1
+```
+
+### 6. ILA 结果怎么判断
+
+如果 ILA 看到：
+
+```text
+dma_len_bytes = 32'h40000000
+```
+
+结论：
+
+```text
+LEN 字节序不对，FPGA 内部没有把 LEN 保存成 64。
+```
+
+如果 ILA 看到：
+
+```text
+dma_addr0 = 32'h0030c0ee
+```
+
+结论：
+
+```text
+地址字节序不对，FPGA 内部保存的地址是反的。
+```
+
+如果 ILA 看到：
+
+```text
+dma_len_bytes = 32'h00000040
+dma_addr0..3 也都是 eec0xxxx
+dma_len_valid = 1
+dma_addr_valid = 1
+但 host_start_flag 仍然不变 1
+```
+
+结论：
+
+```text
+START 条件判断或状态机时序本身有问题，需要 FPGA 端查 always 块优先级、复位条件、dma_stop_flag、pcie_dma_enable 是否有瞬间变化。
+```
+
+### 7. Linux 端下一步
+
+Linux 端暂时不需要改驱动，不要改 `addr_byteswap=0`。
+
+继续使用当前 64B 命令：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=64
+sudo ./build/pcie_color_rx --once --output /tmp/frame_64_test5.bin
+hexdump -C /tmp/frame_64_test5.bin | head
+sudo dmesg | tail -n 120
+```
+
+在 FPGA ILA 没确认 `dma_len_valid=1` 和 `dma_addr_valid=1` 前，不进入 4KB 或全帧测试。
+
+## 2026-07-20：PCIE_DMA_safe_test_6 对 Linux 侧的影响
+
+### 1. FPGA test_6 改动摘要
+
+当前 FPGA 参考工程更新为：
+
+```text
+PCIE_DMA_safe_test_6
+```
+
+FPGA 侧关键改动：
+
+```text
+64B fixed_test_mode 下，START 只要求 dma_addr0 合法。
+整帧模式下，START 才要求 dma_addr0..3 全部合法。
+STATUS 新增 bit8、bit9、bit10 诊断位。
+```
+
+对应 FPGA 逻辑：
+
+```text
+dma_addr0_valid = dma_addr0 != 0 且 4 字节对齐
+dma_addr_valid = dma_addr0..3 全部非 0 且 4 字节对齐
+dma_start_addr_valid = fixed_test_mode ? dma_addr0_valid : dma_addr_valid
+```
+
+这版改动是合理的：64B 固定小包只写 buffer0，不应该被四缓冲整帧规则卡住。
+
+### 2. Linux 侧需要改什么
+
+Linux 侧不需要改 START/LEN/ADDR 写法。
+
+仍然保持：
+
+```text
+START 写 value=0x00000001，实际 written=0x01000000。
+LEN=64 写 value=0x00000040，实际 written=0x40000000。
+ADDR 默认 addr_byteswap=1。
+不要加 addr_byteswap=0。
+```
+
+Linux 侧只需要识别新的 STATUS 高位，当前驱动已增加打印：
+
+```text
+bit8  start_addr_valid
+bit9  len_valid
+bit10 fixed_test
+```
+
+完整 STATUS 位定义变为：
+
+```text
+bit0  busy
+bit1  frame_done
+bit2  start_cmd_seen
+bit3  addr_error
+bit4  host_arm
+bit5  host_start
+bit6  pcie_dma_enable
+bit7  rc_cfg_ep
+bit8  start_addr_valid
+bit9  len_valid
+bit10 fixed_test
+```
+
+### 3. test_6 下 STATUS 怎么判断
+
+如果烧录 test_6 后仍然看到：
+
+```text
+0x50
+0x5c
+```
+
+并且日志里：
+
+```text
+start_addr_valid=0 len_valid=0 fixed_test=0
+```
+
+说明当前运行的 FPGA 很可能还不是 test_6，或者 STATUS 高位没有接到当前 BAR 读回路径。
+
+如果看到类似：
+
+```text
+0x774
+```
+
+拆开是：
+
+```text
+fixed_test=1
+len_valid=1
+start_addr_valid=1
+pcie_dma_enable=1
+host_start=1
+arm=1
+start_cmd_seen=1
+```
+
+说明 64B fixed_test_mode 的 START 合法性门槛已经通过，接下来重点看 MWr 状态机和数据是否写进 Linux buffer。
+
+如果完成后看到类似：
+
+```text
+0x742
+```
+
+拆开是：
+
+```text
+fixed_test=1
+len_valid=1
+start_addr_valid=1
+pcie_dma_enable=1
+frame_done=1
+```
+
+这是 64B DMA 完成的理想状态之一。随后必须看 hexdump 是否不再全是 `cd`。
+
+### 4. test_6 推荐测试命令
+
+确认 FPGA 已重新综合并烧录 `PCIE_DMA_safe_test_6` 后，Linux 端执行：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo make
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=64
+sudo ./build/pcie_color_rx --once --output /tmp/frame_64_test6.bin
+hexdump -C /tmp/frame_64_test6.bin | head
+sudo dmesg | tail -n 140
+```
+
+预期日志里应该能看到新增字段：
+
+```text
+start_addr_valid=1 len_valid=1 fixed_test=1
+```
+
+64B 数据预期不是：
+
+```text
+cd cd cd cd ...
+```
+
+而应该出现 FPGA fixed_test_mode 的固定数据：
+
+```text
+A5A50000, A5A50001, ..., A5A5000F
+```
+
+### 5. 仍然不能做的事
+
+在 64B 没通过前，不要测：
+
+```sh
+./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=4096
+./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=4147200
+```
+
+只有同时满足下面条件，才进入 4KB：
+
+```text
+start_cmd_seen=1
+start_addr_valid=1
+len_valid=1
+fixed_test=1
+addr_error=0
+frame_done=1 或者 host_start 曾经为 1
+hexdump 不再全是 cd
+```
