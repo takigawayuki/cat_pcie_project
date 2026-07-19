@@ -6,6 +6,440 @@
 
 重要边界：`pango_pcie_dma_alloc` 已经验证 PCIe 通信和基础 DMA 可用，当前不修改它；新的彩条接收工作只放在 `camara_host_computer/Colorbar_image`。
 
+
+## 重要事故记录：2026-07-19 系统镜像崩溃
+
+现象：执行到 `./build/pcie_color_rx --validate frame_wait200.rgb565` 附近后，系统镜像崩溃，桌面无法进入。
+
+判断：`--validate` 本身只是读取本地 raw 文件并做 RGB565 采样校验，它不打开 `/dev/colorbar_pcie_rx`，也不会主动触发 PCIe DMA。真正危险的动作发生在前面的 `--once` 阶段：驱动把 4 个 DMA 地址写给 FPGA 后，FPGA 会作为 PCIe Endpoint 主动向 RK3568 物理内存发起 MWR 写事务。
+
+高度怀疑原因：
+
+```text
+BAR 选错
+addr_byteswap 猜错
+FPGA 端 0x110 地址解析和 Linux 端写入方式不一致
+FPGA 仍在使用旧的或错误的 dma_addr0..dma_addr3
+FPGA DMA 没有停止，持续向错误物理地址写数据
+```
+
+如果 FPGA 拿到错误 DMA 地址，它不是只会写坏 `frame_0000.rgb565`，而是可能直接覆盖：
+
+```text
+Linux 内核内存
+页缓存
+systemd/桌面进程内存
+SD 卡文件系统缓存
+rootfs 关键文件
+```
+
+所以这类崩溃可能表现为：
+
+```text
+当前系统卡死
+重启后进不了桌面
+文件系统损坏
+系统镜像需要 fsck 或重刷
+```
+
+从现在开始，未确认 BAR 和 DMA 地址字节序前，禁止直接跑真正启动 DMA 的命令。
+
+当前恢复建议：
+
+```text
+1. 先给鲁班猫和 FPGA 都断电。
+2. 恢复系统前，先拔掉 FPGA/转接板，或者确保 FPGA 不会继续发起 PCIe DMA。
+3. 优先用串口控制台看启动日志；如果能进命令行，先不要进桌面测试 PCIe。
+4. 如果 rootfs 是 SD 卡，建议在另一台 Linux 机器上对分区做 fsck，或者直接重刷镜像。
+5. 重刷或修复后，先不插 FPGA 启动一次，确认系统桌面能正常进入。
+6. 回到 PCIe 测试时，只能先跑安全模式，不加 allow_dma_start=1。
+```
+
+如果能从另一台 Linux 机器看到 SD 卡分区，常见检查命令类似：
+
+```sh
+sudo fsck.ext4 -f /dev/sdX3
+```
+
+这里的 `/dev/sdX3` 必须换成实际 rootfs 分区，不能照抄。看不准设备名就不要执行，避免修错盘。
+
+
+
+## 这个问题到底是 RK 的问题还是 FPGA 的问题
+
+先给结论：
+
+```text
+不是 RK3568 硬件坏了。
+不是 FPGA 芯片坏了。
+也不是 --validate 这条用户态校验命令导致的。
+
+这是 FPGA PCIe DMA 设计和 Linux 驱动控制协议之间没有安全握手，导致 FPGA 可能向 RK3568 的错误物理内存地址写数据。
+```
+
+更准确地说，这是一个 **PCIe DMA 主设备安全控制问题**。
+
+### 1. 谁在主动写内存
+
+在这套系统里：
+
+```text
+RK3568 / 鲁班猫2 = PCIe Root Complex，提供主机内存
+FPGA             = PCIe Endpoint，同时也是 DMA Master
+```
+
+真正发起内存写的人是 FPGA。FPGA 通过 PCIe MWR TLP 主动写 RK3568 的物理内存。
+
+所以如果写错地址，直接破坏的是 RK Linux 内存和文件系统缓存：
+
+```text
+FPGA 发起错误 PCIe MWR
+  -> RK3568 PCIe 控制器接收写事务
+  -> 写入某个物理地址
+  -> 如果这个地址不是 Linux 分配给 DMA buffer 的地址
+  -> 可能覆盖内核、进程、页缓存、rootfs 缓存
+  -> 系统卡死或重启后桌面进不去
+```
+
+这里 RK 只是按照 PCIe 协议接收来自 Endpoint 的 Memory Write。它不会天然知道“这个地址是不是你本来想写的 buffer”。
+
+### 2. 为什么更偏向 FPGA/协议侧问题
+
+从 FPGA 代码看，当前逻辑比较危险：
+
+```text
+Linux 连续写 4 个非零 DMA 地址到 0x110
+FPGA 保存到 dma_addr0..dma_addr3
+只要 4 个地址非 0
+FPGA 就把 rc_cfg_ep_flag 置 1
+后面遇到 VS 边沿就自动开始 DMA
+```
+
+也就是说，FPGA 端当前没有这些保护：
+
+```text
+没有必须先写 MAGIC/ARM 才允许接收地址
+没有单独 START 命令
+没有 ADDR_ECHO 让 Linux 读回确认地址
+没有地址范围检查
+没有 LEN 限制作为安全边界
+没有 STATUS/frame_done 让 Linux 精确判断状态
+```
+
+因此，FPGA 只要保存了错误地址，或者保存了上一次测试残留的旧地址，就可能自动开始写 RK 内存。
+
+这就是为什么问题更偏向：
+
+```text
+FPGA DMA 控制协议不够安全
+FPGA 端缺少防误启动机制
+Linux 驱动一开始也没有足够早地 STOP/清旧地址
+```
+
+### 3. Linux/RK 端有没有责任
+
+有，但不是“RK 硬件问题”。Linux 端的问题是驱动一开始还不够保守。
+
+之前 Linux 驱动存在的风险：
+
+```text
+probe 后没有第一时间 STOP FPGA
+没有第一时间清 dma_addr0..3
+allow_dma_start 保护只能阻止写新地址，不能阻止 FPGA 使用旧地址
+早期文档建议尝试 bar=0/1、addr_byteswap=0/1，这对 DMA master 来说太冒险
+```
+
+现在 Linux 端已经做了补救：
+
+```text
+probe 阶段先 safe_stop，再 pci_set_master，避免旧地址窗口期自动 DMA
+probe 阶段写 0x130 STOP，并连续 4 次写 0 到 0x110，尝试清 dma_addr0..3
+STOP/FREE/remove 都走 safe stop
+新增 --safe-stop，用户可手动 STOP + 清地址
+allow_dma_start 默认 0，不显式允许就不 START
+START 前打印 Linux DMA 地址和实际写给 FPGA 的值
+```
+
+所以现在 Linux 端的原则是：
+
+```text
+默认不启动 DMA
+先清旧状态
+必须人工确认 FPGA 保存的地址正确
+确认后才 allow_dma_start=1
+```
+
+### 4. RK3568 本身能不能避免这个问题
+
+一般情况下，普通嵌入式 Linux PCIe RC 不一定默认给 Endpoint 开严格 IOMMU 隔离。没有 IOMMU/DMA remapping 保护时，PCIe Endpoint 作为 DMA Master 拿到什么地址就能写什么地址。
+
+所以 RK3568 不是“坏了”，而是：
+
+```text
+它没有自动替你阻止一个 PCIe Endpoint 写错物理地址。
+```
+
+如果平台有可用 IOMMU/SMMU 并且 PCIe 设备接入了 IOMMU，理论上可以把 FPGA DMA 限制在指定 buffer 范围内。但当前工程没有确认 RK3568 PCIe 对这个 Endpoint 已启用 IOMMU 隔离，所以不能假设它能兜底。
+
+### 5. 最终责任怎么划分
+
+可以这样划分：
+
+| 层级 | 是否有问题 | 说明 |
+| --- | --- | --- |
+| RK3568 硬件 | 不是主要问题 | 它只是执行 PCIe Memory Write，不能自动判断地址是否逻辑正确 |
+| Linux 系统 | 受害者 | 错误 DMA 会破坏 Linux 内存、页缓存、文件系统 |
+| Linux 驱动早期版本 | 有不足 | probe 阶段没有立即 STOP/清旧地址，安全闸门不够早 |
+| 当前 Linux 驱动 | 已补强 | 增加 probe STOP、清地址、allow_dma_start、--safe-stop |
+| FPGA 当前 DMA 协议 | 主要风险来源 | 4 地址非 0 就自动 DMA，缺少 MAGIC/START/ADDR_ECHO/STATUS/LEN |
+| FPGA 芯片硬件 | 不是坏 | 当前看不到会伤 FPGA 寿命的逻辑，风险主要是写坏 RK Linux 系统 |
+
+一句话总结：
+
+```text
+问题主要不是 RK 的问题，而是 FPGA DMA 协议太信任软件写入的地址；Linux 早期驱动也没有足够早地清掉 FPGA 残留 DMA 状态。当前 Linux 侧已经补强，但要真正安全，还需要 FPGA 端增加 MAGIC/START/ADDR_ECHO/STATUS/LEN 这些保护。
+```
+
+### 6. 对 Linux 负责人的实际要求
+
+你作为 Linux 端负责人，后续不要把目标理解成“修 RK”。你的目标是：
+
+```text
+让 Linux 驱动默认不启动危险 DMA
+上电后先 STOP/清地址
+提供 --safe-stop 手动清状态
+打印 DMA 地址给 FPGA 端核对
+没有 FPGA 地址回读/ILA 确认前，不允许 allow_dma_start=1
+```
+
+而需要 FPGA 端配合的事情是：
+
+```text
+确认 0x130 STOP 能清地址并停止 MWR
+确认 addr_byteswap=1 后 dma_addr0..3 和 Linux written 值一致
+增加 ADDR_ECHO，让 Linux 能读回地址
+增加 MAGIC/ARM 和 START，禁止 4 个地址非 0 就自动 DMA
+增加 STATUS/frame_done，替代固定延时
+增加 LEN，限制每帧最大写入长度
+```
+
+## FPGA 代码核查结论：问题是什么，是否伤硬件
+
+已核查 FPGA 文件：
+
+```text
+PCIE_DMA_test_color_MES50HP_X1/source/pcie_dma_ctrl.v
+PCIE_DMA_test_color_MES50HP_X1/source/ddr_test_top_pcie_fixed.v
+PCIE_DMA_test_color_MES50HP_X1/source/ddr_test_top.v
+PCIE_DMA_test_color_MES50HP_X1/ipcore/pcie_test/example_design/rtl/ipsl_pcie_dma_ctrl/ipsl_pcie_dma_rx_top.v
+```
+
+结论分两层看。
+
+第一层：这次系统崩溃的高概率原因是 PCIe DMA 写错主机物理地址。
+
+依据：
+
+```text
+pcie_dma_ctrl.v 里 0x110 是 DMA 地址配置寄存器
+Linux 连续写 4 次 0x110 后，FPGA 保存为 dma_addr0..dma_addr3
+FPGA 代码会把 Linux 写入的数据做 32-bit 字节重排后保存
+4 个 dma_addr 都非 0 后，rc_cfg_ep_flag 置 1
+后续遇到视频 VS 边沿和 FIFO 水位条件后，FPGA 自动发起 MWR 写主机内存
+MWR TLP Header 里的目标地址来自 alloc_addrl，也就是 dma_addr0..dma_addr3
+每个 TLP 写 64 bytes，单帧约 4 MB
+```
+
+关键代码位置：
+
+```text
+pcie_dma_ctrl.v:40   DMA_CMD_L_ADDR = 12'h110
+pcie_dma_ctrl.v:41   DMA_CMD_CLEAR_ADDR = 12'h130
+pcie_dma_ctrl.v:157  收到 MWR_32 且偏移 0x110 时保存 DMA 地址
+pcie_dma_ctrl.v:161  dma_addr0 做了字节重排
+pcie_dma_ctrl.v:166  dma_addr1 做了字节重排
+pcie_dma_ctrl.v:171  dma_addr2 做了字节重排
+pcie_dma_ctrl.v:176  dma_addr3 做了字节重排
+pcie_dma_ctrl.v:221  4 个地址非 0 后 rc_cfg_ep_flag 置 1
+pcie_dma_ctrl.v:224  VS 边沿后开始准备一帧 DMA
+pcie_dma_ctrl.v:322  MWR 目标地址使用 alloc_addrl
+pcie_dma_ctrl.v:355  每个 TLP 后 alloc_addrl += 64
+pcie_dma_ctrl.v:181  收到 0x130 后 dma_stop_flag 置 1
+```
+
+第二层：从目前代码看，这类问题主要伤 Linux 系统，不是伤板子硬件寿命。
+
+原因：FPGA 发的是 PCIe Memory Write TLP，本质是“往主机物理地址写数据”。如果地址错，危险对象是：
+
+```text
+Linux 内核内存
+用户进程内存
+页缓存
+SD 卡 rootfs 文件系统缓存
+系统文件
+```
+
+所以可能导致系统卡死、文件系统损坏、桌面进不去。但这不等价于烧坏鲁班猫或 FPGA。当前代码没有看到会直接改变电源、电压、IO 标准、时钟过压这类会影响硬件寿命的行为。
+
+仍然要注意：硬件寿命风险主要来自这些外部因素，不是这段 DMA 逻辑本身：
+
+```text
+热插拔 PCIe 转接板
+供电电压不匹配或电源不稳
+PERST#、REFCLK、GND 接触不可靠
+接口方向或排线接错
+FPGA IO 电平标准与转接板不匹配
+长时间短路、过流、过热
+```
+
+所以为了安全，后续操作原则是：
+
+```text
+不热插拔
+先断电再插拔转接板和 FPGA
+系统恢复前先拔掉 FPGA，避免旧 bitstream 继续 DMA
+不确认 BAR 和地址字节序前，不允许 allow_dma_start=1
+不靠 bar=0/1、addr_byteswap=0/1 盲试
+必须用 FPGA ILA/SignalTap 对比 Linux dmesg 里的 written 地址和 FPGA 内部 dma_addr0..dma_addr3
+```
+
+Linux 驱动已经加了保护：
+
+```text
+allow_dma_start 默认是 0，不会真正启动 FPGA DMA
+只有显式 insmod allow_dma_start=1 才会向 FPGA 写 4 个 DMA 地址
+驱动会打印 dma_addr、low32、written、addr_byteswap，供 FPGA 端抓波形对比
+```
+
+真正想把风险再降一档，建议 FPGA 端后续加协议保护：
+
+```text
+增加 ARM/MAGIC 寄存器，例如必须先写 0xA55A5AA5 才允许 DMA
+增加 START 寄存器，不要 4 个地址非 0 就自动开始
+增加 LEN 寄存器，限制最多写 4147200 或 4147264 bytes
+增加 STATUS 寄存器，可读 current_page/frame_done/dma_busy/error
+增加 ADDR_ECHO 寄存器，可让 Linux 读回 FPGA 实际保存的 dma_addr0..dma_addr3
+STOP 后立即清空地址并禁止继续 MWR
+如果地址为 0、未对齐、未 armed，禁止 MWR
+```
+
+在 FPGA 端没有这些保护前，Linux 只能靠 `allow_dma_start=0` 默认保护和人工核对降低风险，不能从软件上 100% 硬隔离一个配置错误的 PCIe DMA Master。
+
+## 对 PCIe 调试安全指南的采纳情况
+
+针对 `PCIe调试安全指南与优化建议.md`，当前 Linux 工程已经采纳这些建议：
+
+```text
+[x] probe 阶段立即写 STOP，降低 FPGA 使用旧 DMA 地址自动写主机内存的风险
+[x] probe 阶段连续 4 次写 0 到 0x110，尝试清除 dma_addr0..3
+[x] allow_dma_start 默认关闭，不显式允许就拒绝 START
+[x] addr_byteswap 默认按 FPGA 当前字节反转逻辑设为 1；真正启动仍由 allow_dma_start 控制
+[x] START 前打印 dma_addr、low32、written、addr_byteswap，便于和 FPGA ILA 对表
+[x] STOP/FREE/remove 都走安全停止路径
+[x] 新增用户态 --safe-stop，只 STOP + 清地址，不分配 buffer，不启动 DMA
+```
+
+暂不建议现在做的 Linux 侧功能：
+
+```text
+bar_auto_detect：没有 FPGA 回读寄存器时只能靠写 STOP/0 探测，不能真正证明 BAR 正确
+--probe-bar：如果用 devmem/resource 做裸写，反而容易绕过驱动保护，不适合现在阶段
+自动尝试 bar=0/1、addr_byteswap=0/1：这属于盲试 DMA 地址，风险太高
+```
+
+我额外建议增加两条 Linux 侧规则：
+
+```text
+1. 正式采集前必须先执行 --safe-stop 并查看 dmesg，确认 STOP 日志出现。
+2. 采集生成的 raw 文件先保存到 /tmp 或外接 U 盘，减少 SD 卡 rootfs 被异常写缓存影响的概率。
+```
+
+仍然必须让 FPGA 端配合的建议：
+
+```text
+ADDR_ECHO：Linux 读回 FPGA 实际保存的 dma_addr0..3，这是最关键的安全改进
+ARM/MAGIC：没有 magic 不接受 0x110 地址写入
+START：不要 4 个地址非 0 就自动启动
+STATUS/frame_done：替代 Linux 固定 frame_wait_ms
+LEN：限制每帧最多写入字节数
+STOP 后清地址并禁止继续 MWR：当前代码已有类似逻辑，但建议 FPGA 端再确认综合后行为
+```
+
+
+## 对安全指南第 11 节更新的分析
+
+`PCIe调试安全指南与优化建议.md` 最后一节的核心判断是有价值的：当前最大的残余风险确实不是 `--once` 里的新地址写入，而是 **FPGA 内部可能残留旧 dma_addr0..3**。如果旧地址非零、PCIe Bus Master 又被重新打开、同时 VS 信号存在，FPGA 可能不等 Linux START 就自动 MWR 写主机内存。
+
+我认可这些结论：
+
+```text
+1. FPGA 当前启动条件是 4 个地址非零 + EP 活跃 + VS 边沿。
+2. allow_dma_start=0 只能阻止 Linux 写入新地址，不能清除 FPGA 内部旧地址。
+3. probe 阶段必须尽早 STOP + 清 dma_addr0..3。
+4. remove 阶段也必须 STOP + 清地址，避免下一次 insmod 继承旧状态。
+5. addr_byteswap=1 符合当前 FPGA 32-bit 地址字节反转逻辑。
+6. 32-bit DMA mask 和 buffer 尺寸余量是必要保护。
+```
+
+但我认为第 11 节里有一个地方还可以更保守：
+
+```text
+原说法：pci_set_master() 后几个微秒内 safe_stop，通常能赶在第一个 VS 边沿前清旧地址。
+我的判断：不应该依赖“通常能赶上”。更安全做法是先不要开启 Bus Master。
+```
+
+当前代码已经按更保守方案调整：
+
+```text
+probe 顺序：
+1. pci_enable_device_mem()       只允许主机访问 BAR/MMIO
+2. pci_request_region()
+3. pci_iomap()
+4. colorbar_hw_safe_stop()       写 0x130 STOP + 4 次 0x110=0
+5. pci_set_master()              最后才允许 FPGA 主动 DMA
+```
+
+这样做的意义：
+
+```text
+主机写 BAR 不需要 FPGA 具备 Bus Master 能力。
+FPGA 主动发起 PCIe MWR 才需要 Bus Master。
+所以先 STOP/清地址，再 pci_set_master，可以进一步缩短甚至消除旧地址自动 DMA 的窗口。
+```
+
+remove 阶段也已经调整为：
+
+```text
+1. colorbar_stop_locked()        STOP + 清地址
+2. pci_clear_master()            关闭 Endpoint Bus Master 能力
+3. colorbar_free_buffers_locked()
+4. pci_iounmap/pci_release/pci_disable
+```
+
+对第 11 节“唯一残余风险是 BAR 选错”的分析，我的补充是：
+
+```text
+这个判断基本对，但前提是 FPGA 内部确实可能残留旧地址。
+如果 FPGA 重新上电/重新加载 bitstream，旧地址归零，那么 BAR 选错通常不会立刻导致旧地址 DMA。
+如果没有重新上电，且上一次异常退出留下旧地址，那么 BAR 选错会让 STOP 无法到达 FPGA，这是高风险。
+```
+
+因此更严格的安全流程是：
+
+```text
+1. 发生过系统崩溃后，先给 FPGA 重新上电或重新加载 bitstream。
+2. Linux 驱动 probe 阶段先 safe_stop，再 pci_set_master。
+3. 手动执行 --safe-stop，再看 dmesg 确认日志。
+4. 未确认 BAR 正确前，不加 allow_dma_start=1。
+5. 最终仍建议 FPGA 端增加 ADDR_ECHO/STATUS/MAGIC/START，彻底消除 BAR 和地址猜测。
+```
+
+一句话：
+
+```text
+第 11 节指出的旧地址残留风险是对的；当前 Linux 侧已经进一步把 pci_set_master 延后到 safe_stop 之后，比指南里的 probe 防护更保守。
+```
+
 ## 时间线 0：先明确现在到底在测什么
 
 现在这套测试测的是：
@@ -156,8 +590,10 @@ driver/colorbar_pcie_driver.ko   独立 PCIe 彩条接收驱动
 分配 4 个 DMA coherent buffer
 每个 buffer 大小 4149248 bytes
 mmap 给用户态直接读取
+probe 时立即 STOP 并连续 4 次写 0 清除 FPGA 旧 DMA 地址
+默认禁止真正 START，必须显式 allow_dma_start=1 才会向 FPGA 写 DMA 地址
 START 时连续 4 次写 BAR+0x110，把 DMA 地址告诉 FPGA
-STOP 时写 BAR+0x130
+STOP/SAFE_STOP 时写 BAR+0x130 并连续 4 次写 0 清地址
 WAIT_FRAME 当前先用 frame_wait_ms 固定延时模拟等待一帧
 ```
 
@@ -165,6 +601,7 @@ WAIT_FRAME 当前先用 frame_wait_ms 固定延时模拟等待一帧
 
 ```text
 --info                         显示当前图像和 buffer 参数
+--safe-stop                    只发送 STOP + 清 4 个地址，不启动 DMA
 --once --output frame.rgb565   接收并保存一帧 raw 图像
 --validate frame.rgb565        抽样校验 RGB565 彩条颜色
 ```
@@ -270,7 +707,7 @@ lsmod | grep pango_pci_driver
 
 ## 时间线 8：加载新的彩条接收驱动
 
-默认先试 BAR1，地址字节反转打开：
+先加载安全模式。安全模式下不会真正启动 FPGA DMA：
 
 ```sh
 sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 frame_wait_ms=100
@@ -279,10 +716,30 @@ sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 frame_wait_ms=1
 参数含义：
 
 ```text
-bar=1              先按 BAR1 映射 FPGA 控制寄存器，不对再试 bar=0
-addr_byteswap=1    按当前 FPGA 0x110 地址解析逻辑做 32-bit 字节反转
-frame_wait_ms=100  临时等待一帧 100ms，后续应换成 FPGA 状态寄存器或中断
+bar=1                先按 BAR1 映射 FPGA 控制寄存器，不对再试 bar=0
+addr_byteswap=1      按 FPGA 当前 32-bit 地址字节反转逻辑写地址
+allow_dma_start=0    默认值，禁止 START 真正向 FPGA 写 DMA 地址
+frame_wait_ms=100    临时等待一帧 100ms，后续应换成 FPGA 状态寄存器或中断
 ```
+
+只有同时满足下面条件，才允许显式打开 DMA：
+
+```text
+已经备份或准备好重刷系统镜像
+FPGA 端确认控制寄存器确实在当前 BAR
+FPGA 端确认 0x110 连续 4 次写地址协议正确
+FPGA 端用 ILA/SignalTap 确认收到的 dma_addr 和 dmesg 打印的 dma_addr 完全一致
+FPGA 端确认 0x130 stop 有效，且不会继续使用旧 DMA 地址写主机内存
+```
+
+确认后才使用：
+
+```sh
+sudo rmmod colorbar_pcie_driver
+sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 allow_dma_start=1 frame_wait_ms=100
+```
+
+当前 FPGA 代码已经显示内部会做 32-bit 字节反转，所以默认使用 `addr_byteswap=1`。如果 FPGA 端后续修改了地址解析逻辑，再同步改 Linux 参数。
 
 确认模块：
 
@@ -319,11 +776,13 @@ lsmod | grep colorbar_pcie_driver
 
 ## 时间线 9：接收并保存一帧 raw 图像
 
-驱动加载成功，并且 `/dev/colorbar_pcie_rx` 存在后运行：
+驱动加载成功，并且 `/dev/colorbar_pcie_rx` 存在后，只有在 `allow_dma_start=1` 已经明确打开时才运行：
 
 ```sh
 sudo ./build/pcie_color_rx --once --output frame_0000.rgb565
 ```
+
+如果没有加 `allow_dma_start=1`，这条命令应该在 `COLORBAR_IOC_START` 处失败，这是预期的安全保护，表示没有真正启动 FPGA DMA。
 
 这一步内部会做：
 
@@ -412,41 +871,46 @@ lspci -nn
 dmesg | tail -n 120
 ```
 
-### 11.3 BAR1 不行就试 BAR0
+### 11.3 BAR 或地址字节序不能靠反复盲试
 
-```sh
-sudo rmmod colorbar_pcie_driver
-sudo insmod driver/colorbar_pcie_driver.ko bar=0 addr_byteswap=1 frame_wait_ms=100
-sudo ./build/pcie_color_rx --once --output frame_bar0.rgb565
-./build/pcie_color_rx --validate frame_bar0.rgb565
+之前系统镜像崩溃后，不能再按“BAR1 不行就试 BAR0、addr_byteswap 不行就反过来”的方式盲试。原因是 FPGA DMA 一旦拿到错误地址，可能写坏任意主机内存。
+
+正确顺序是：
+
+```text
+先让 FPGA 端用 ILA/SignalTap 抓 BAR 写事务
+确认 Linux 写的是不是 FPGA 真正监听的 BAR
+确认 Linux 写 BAR+0x110 时，FPGA 内部 dma_addr0..dma_addr3 变成了什么值
+把 FPGA 抓到的 dma_addr 和 Linux dmesg 打印的 dma_addr 对比
+完全一致后，再 allow_dma_start=1
 ```
 
-### 11.4 数据全 0 或完全不变就试地址字节序
-
-先试关闭字节反转：
-
-```sh
-sudo rmmod colorbar_pcie_driver
-sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=0 frame_wait_ms=100
-sudo ./build/pcie_color_rx --once --output frame_noswap.rgb565
-./build/pcie_color_rx --validate frame_noswap.rgb565
-```
-
-也可以组合试：
+安全加载但不启动 DMA：
 
 ```sh
 sudo rmmod colorbar_pcie_driver
 sudo insmod driver/colorbar_pcie_driver.ko bar=0 addr_byteswap=0 frame_wait_ms=100
 ```
 
-### 11.5 数据像半帧或偶发错就加等待时间
+真正启动 DMA 只能在协议确认后执行，例如：
 
 ```sh
 sudo rmmod colorbar_pcie_driver
-sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 frame_wait_ms=200
+sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 allow_dma_start=1 frame_wait_ms=100
+sudo ./build/pcie_color_rx --once --output frame_0000.rgb565
+./build/pcie_color_rx --validate frame_0000.rgb565
+```
+
+### 11.4 数据像半帧或偶发错就加等待时间
+
+```sh
+sudo rmmod colorbar_pcie_driver
+sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 allow_dma_start=1 frame_wait_ms=200
 sudo ./build/pcie_color_rx --once --output frame_wait200.rgb565
 ./build/pcie_color_rx --validate frame_wait200.rgb565
 ```
+
+前提仍然是 BAR 和地址字节序已经确认，不能用这组命令盲试。
 
 可尝试：
 
@@ -484,7 +948,7 @@ sudo fuser -v /dev/colorbar_pcie_rx
 
 ## 时间线 13：当前最推荐的一整套命令
 
-如果 FPGA 彩条 bitstream 已经运行、PCIe 已经 link up，直接按这个顺序跑：
+系统镜像崩溃后，当前最推荐的命令改成“安全检查版”，不真正启动 DMA：
 
 ```sh
 cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
@@ -494,11 +958,33 @@ sudo rmmod pango_pci_driver 2>/dev/null || true
 sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 frame_wait_ms=100
 ls -l /dev/colorbar_pcie_rx
 dmesg | tail -n 120
+sudo ./build/pcie_color_rx --safe-stop
+dmesg | tail -n 80
+sudo ./build/pcie_color_rx --once --output frame_0000.rgb565
+sudo rmmod colorbar_pcie_driver
+```
+
+这时 `--once` 应该因为没有 `allow_dma_start=1` 而失败，目的是确认保护生效，不让 FPGA 真正写主机内存。
+
+等 FPGA 端确认 BAR 和地址字节序后，才使用真正采集版：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+make
+lspci -nn
+sudo rmmod pango_pci_driver 2>/dev/null || true
+sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 allow_dma_start=1 frame_wait_ms=100
+ls -l /dev/colorbar_pcie_rx
+dmesg | tail -n 120
+sudo ./build/pcie_color_rx --safe-stop
+dmesg | tail -n 80
 sudo ./build/pcie_color_rx --once --output frame_0000.rgb565
 ls -l frame_0000.rgb565
 ./build/pcie_color_rx --validate frame_0000.rgb565
 sudo rmmod colorbar_pcie_driver
 ```
+
+当前真正采集版默认使用 `addr_byteswap=1`；如果 FPGA 端后续移除地址字节反转，再改为 `addr_byteswap=0`。
 
 ## 时间线 14：当前完成状态和下一步
 
@@ -512,6 +998,8 @@ sudo rmmod colorbar_pcie_driver
 [x] 4 个 DMA coherent buffer
 [x] mmap 给用户态
 [x] START 连续 4 次写 BAR+0x110
+[x] 新增 allow_dma_start 保护，默认禁止误启动 FPGA DMA
+[x] 新增 --safe-stop / COLORBAR_IOC_SAFE_STOP，手动 STOP + 清旧地址
 [x] STOP 写 BAR+0x130
 [x] 用户态 --info
 [x] 用户态 --once 保存一帧 raw
@@ -524,7 +1012,7 @@ sudo rmmod colorbar_pcie_driver
 ```text
 [ ] colorbar_pcie_driver.ko 能否 probe 到 0755:0755
 [ ] 实际控制 BAR 是 bar=1 还是 bar=0
-[ ] addr_byteswap 应该是 1 还是 0
+[x] 当前 FPGA 代码下 addr_byteswap 应为 1
 [ ] --once 能否保存有效 frame_0000.rgb565
 [ ] --validate 是否全部 OK
 ```
@@ -538,3 +1026,550 @@ sudo rmmod colorbar_pcie_driver
 [ ] 做 RGB565 到显示输出，接入 fb0/DRM 或保存转换成 PNG 预览
 [ ] 必要时再考虑 V4L2 设备化
 ```
+
+## 当前下一步到底要调试什么
+
+现在不要急着调试“彩条图像内容对不对”，也不要急着加 `allow_dma_start=1` 真正采集。
+
+当前第一目标是调试：
+
+```text
+Linux 和 FPGA 之间的 PCIe DMA 安全握手是否成立。
+```
+
+也就是说，先确认不会再出现 FPGA 写错 RK3568 内存、导致系统镜像损坏的问题。
+
+### 1. 当前最优先调试的问题
+
+按优先级排列：
+
+```text
+1. BAR 到底对不对
+2. STOP 是否真的到达 FPGA
+3. STOP 是否真的能清 dma_addr0..3 和 DMA 状态
+4. addr_byteswap=1 后，FPGA 内部 dma_addr0..3 是否等于 Linux DMA 地址
+5. 不加 allow_dma_start=1 时，FPGA 是否绝对不会启动 DMA
+```
+
+### 2. 问题 1：BAR 到底对不对
+
+Linux 现在默认使用：
+
+```sh
+bar=1
+```
+
+但必须确认：
+
+```text
+Linux 写 BAR1 + 0x130 时，FPGA 端 dma_stop_flag 有没有变化。
+Linux 写 BAR1 + 0x110 时，FPGA 端 dma_addr0..3 有没有变化。
+```
+
+如果 BAR 错了，Linux 以为自己在 STOP，实际上 FPGA 没收到，旧 DMA 地址可能还在。
+
+所以 BAR 是当前最关键的问题。
+
+### 3. 问题 2：STOP 是否真的清掉 FPGA 状态
+
+Linux 的 `--safe-stop` 会做：
+
+```text
+写 0x130 STOP
+连续 4 次写 0 到 0x110
+```
+
+FPGA 端应该看到：
+
+```text
+dma_stop_flag 置 1
+dma_addr0 = 0
+dma_addr1 = 0
+dma_addr2 = 0
+dma_addr3 = 0
+rc_cfg_ep_flag = 0
+fram_start = 0
+dma_start = 0
+dma_cnt = 0
+```
+
+这一步如果没有确认，就不能认为系统安全。
+
+### 4. 问题 3：addr_byteswap=1 是否正确
+
+当前 FPGA 代码里对 32-bit 地址做了字节反转，所以 Linux 默认使用：
+
+```sh
+addr_byteswap=1
+```
+
+驱动 START 前会在 `dmesg` 打印类似：
+
+```text
+program DMA address: dma=... low32=0x???????? written=0x???????? addr_byteswap=1
+```
+
+需要 FPGA 端用 ILA/SignalTap 对比：
+
+```text
+FPGA 内部 dma_addr0..3 是否等于 Linux dmesg 里的 low32 原始 DMA 地址。
+```
+
+如果 FPGA 内部保存的是 `written`，或者是其他值，说明字节序理解还不对。
+
+### 5. 问题 4：不加 allow_dma_start=1 时是否绝对不会 DMA
+
+这是 Linux 侧安全底线。
+
+安全模式加载：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 frame_wait_ms=100
+```
+
+手动安全停止：
+
+```sh
+sudo ./build/pcie_color_rx --safe-stop
+dmesg | tail -n 100
+```
+
+然后故意执行一次 `--once`：
+
+```sh
+sudo ./build/pcie_color_rx --once --output /tmp/frame_test.rgb565
+```
+
+预期结果：
+
+```text
+COLORBAR_IOC_START: Operation not permitted
+```
+
+这个失败是正确的，说明：
+
+```text
+allow_dma_start=0 时，驱动拒绝 START。
+Linux 没有向 FPGA 写入新的非零 DMA 地址。
+FPGA 不应该启动 DMA。
+```
+
+### 6. 安全调试命令顺序
+
+当前推荐只跑这一组，不要加 `allow_dma_start=1`：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+make
+lspci -nn
+sudo rmmod pango_pci_driver 2>/dev/null || true
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 frame_wait_ms=100
+ls -l /dev/colorbar_pcie_rx
+dmesg | tail -n 120
+sudo ./build/pcie_color_rx --safe-stop
+dmesg | tail -n 100
+sudo ./build/pcie_color_rx --once --output /tmp/frame_test.rgb565
+sudo rmmod colorbar_pcie_driver
+```
+
+预期：
+
+```text
+--safe-stop 成功
+--once 在 COLORBAR_IOC_START 处被拒绝
+系统不崩溃
+重启后系统仍然正常
+```
+
+### 7. FPGA 端需要配合抓的信号
+
+请 FPGA 端优先抓这些信号：
+
+```text
+tlp_fmt
+tlp_type
+mwr_addr
+cmd_reg_addr
+dma_addr0
+dma_addr1
+dma_addr2
+dma_addr3
+dma_stop_flag
+rc_cfg_ep_flag
+fram_start
+dma_start
+dma_cnt
+bar_hit 或 o_bar1_wr_en
+```
+
+重点观察：
+
+```text
+Linux 执行 --safe-stop 时，cmd_reg_addr 是否出现 0x130。
+Linux 执行 --safe-stop 后，dma_addr0..3 是否为 0。
+Linux 不加 allow_dma_start=1 执行 --once 时，dma_addr0..3 是否仍为 0。
+Linux 不加 allow_dma_start=1 执行 --once 时，dma_start 是否保持 0。
+```
+
+### 8. 什么时候才能真正采集一帧
+
+只有下面条件都满足，才允许进入真正采集阶段：
+
+```text
+[ ] 确认 BAR 正确
+[ ] 确认 0x130 STOP 能到达 FPGA
+[ ] 确认 --safe-stop 后 dma_addr0..3 全部为 0
+[ ] 确认 allow_dma_start=0 时 --once 被拒绝，FPGA 不启动 DMA
+[ ] 确认 addr_byteswap=1 后，FPGA 内部 dma_addr0..3 等于 Linux DMA 地址
+[ ] 已经备份系统镜像或准备好重刷
+```
+
+满足后，才使用：
+
+```sh
+sudo rmmod colorbar_pcie_driver
+sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 allow_dma_start=1 frame_wait_ms=100
+sudo ./build/pcie_color_rx --safe-stop
+sudo ./build/pcie_color_rx --once --output /tmp/frame_0000.rgb565
+./build/pcie_color_rx --validate /tmp/frame_0000.rgb565
+sudo rmmod colorbar_pcie_driver
+```
+
+### 9. 当前一句话结论
+
+```text
+现在要调试的是 BAR、STOP、清地址、字节序、allow_dma_start 保护是否成立。
+这些都确认之前，不调试彩条图像内容，也不真正启动 DMA。
+```
+
+
+## BAR 和安全链路具体怎么调试
+
+这一节只讲“具体怎么看、看什么、按什么顺序判断”。当前不要直接调图像内容，先把 PCIe 控制链路和 DMA 安全链路调通。
+
+### 1. 总体原则
+
+BAR 要两边一起看：
+
+```text
+Linux 侧：看这个 PCIe 设备枚举出了哪些 BAR，每个 BAR 的物理地址和大小是多少。
+FPGA 侧：看 Linux 写某个 BAR 的偏移时，FPGA 控制逻辑是否真的收到。
+```
+
+最终以 FPGA 侧为准：
+
+```text
+Linux 写 BARx + 0x130
+FPGA 端 cmd_reg_addr 看到 0x130
+dma_stop_flag 跳变
+```
+
+只有这样才能证明 `bar=x` 是正确的控制 BAR。
+
+### 2. 调试前安全前提
+
+每次做 BAR 调试前，先保证 FPGA 内部没有旧 DMA 地址：
+
+```text
+优先方式：FPGA 重新上电或重新加载 bitstream。
+目的：让 dma_addr0..3 回到 0，避免旧地址残留。
+```
+
+Linux 侧不要加：
+
+```sh
+allow_dma_start=1
+```
+
+只允许安全模式：
+
+```sh
+allow_dma_start=0
+```
+
+也就是 insmod 时不写 `allow_dma_start=1`。
+
+### 3. 第一步：Linux 侧看枚举出来的 BAR
+
+运行：
+
+```sh
+lspci -vv -s 01:00.0
+cat /sys/bus/pci/devices/0000:01:00.0/resource
+```
+
+重点看：
+
+```text
+BAR0 起始地址、结束地址、大小
+BAR1 起始地址、结束地址、大小
+BAR2 起始地址、结束地址、大小
+```
+
+之前日志里类似：
+
+```text
+BAR0: 0xf4200000 - 0xf4201fff  大小 8KB
+BAR1: 0xf4204000 - 0xf4204fff  大小 4KB
+BAR2: 0xf4202000 - 0xf4203fff  大小 8KB，64-bit
+```
+
+这一步只能说明 Linux 看到哪些 BAR，不能证明 FPGA 控制逻辑在哪个 BAR。
+
+### 4. 第二步：先测 bar=1 的 STOP 是否到 FPGA
+
+因为 Pango PCIe IP 代码里有 `o_bar1_wr_en`，并且 BAR1 大小像控制寄存器空间，所以先测 `bar=1`。
+
+Linux 侧执行：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+make
+sudo rmmod pango_pci_driver 2>/dev/null || true
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 frame_wait_ms=100
+dmesg | tail -n 120
+sudo ./build/pcie_color_rx --safe-stop
+dmesg | tail -n 100
+sudo rmmod colorbar_pcie_driver
+```
+
+FPGA 端抓这些信号：
+
+```text
+bar_hit
+o_bar1_wr_en
+mwr_addr
+cmd_reg_addr
+dma_stop_flag
+dma_addr0
+dma_addr1
+dma_addr2
+dma_addr3
+rc_cfg_ep_flag
+fram_start
+dma_start
+```
+
+判断标准：
+
+```text
+看到 cmd_reg_addr = 0x130
+看到 dma_stop_flag 跳变
+safe-stop 后 dma_addr0..3 全部为 0
+rc_cfg_ep_flag = 0
+fram_start = 0
+dma_start = 0
+```
+
+如果这些都成立：
+
+```text
+bar=1 基本确认是控制 BAR。
+```
+
+如果 FPGA 完全看不到 `0x130` 或 `dma_stop_flag` 不动：
+
+```text
+bar=1 可能不是控制 BAR，或者 FPGA 抓取信号位置不对。
+```
+
+### 5. 第三步：如果 bar=1 不通，再安全测 bar=0
+
+只有在 FPGA 已重新上电或重新加载 bitstream、确认旧地址为 0 的情况下，才测试 `bar=0`。
+
+Linux 侧执行：
+
+```sh
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+sudo insmod driver/colorbar_pcie_driver.ko bar=0 addr_byteswap=1 frame_wait_ms=100
+dmesg | tail -n 120
+sudo ./build/pcie_color_rx --safe-stop
+dmesg | tail -n 100
+sudo rmmod colorbar_pcie_driver
+```
+
+FPGA 端仍然看：
+
+```text
+cmd_reg_addr 是否出现 0x130
+dma_stop_flag 是否跳变
+dma_addr0..3 是否为 0
+```
+
+判断：
+
+```text
+bar=0 能触发 0x130，bar=1 不能 -> 控制 BAR 是 BAR0。
+bar=1 能触发 0x130，bar=0 不能 -> 控制 BAR 是 BAR1。
+两个都不能 -> Linux 写入没有进 pcie_dma_ctrl，需检查 PCIe IP BAR 配置/抓取信号/顶层连接。
+两个都能 -> 需要 FPGA 端确认 BAR 解码是否有重叠或两个路径都接到了控制逻辑。
+```
+
+### 6. 第四步：确认 allow_dma_start=0 保护是否有效
+
+确认 BAR 后，继续保持不加 `allow_dma_start=1`。
+
+Linux 侧执行：
+
+```sh
+sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 frame_wait_ms=100
+sudo ./build/pcie_color_rx --safe-stop
+sudo ./build/pcie_color_rx --once --output /tmp/frame_test.rgb565
+sudo rmmod colorbar_pcie_driver
+```
+
+如果正确，`--once` 应该报：
+
+```text
+COLORBAR_IOC_START: Operation not permitted
+```
+
+FPGA 端应该看到：
+
+```text
+dma_addr0..3 仍然为 0
+rc_cfg_ep_flag 仍然为 0
+dma_start 不跳变
+没有 MWR 发出
+```
+
+这一步通过，说明 Linux 安全闸门有效。
+
+### 7. 第五步：确认 addr_byteswap=1 是否正确
+
+当前 FPGA 代码对地址做了字节反转：
+
+```verilog
+dma_addr0 <= {data[7:0], data[15:8], data[23:16], data[31:24]};
+```
+
+所以 Linux 默认：
+
+```sh
+addr_byteswap=1
+```
+
+真正写地址时，驱动会打印：
+
+```text
+program DMA address: dma=... low32=0xAAAAAAAA written=0xBBBBBBBB addr_byteswap=1
+```
+
+FPGA 端要确认：
+
+```text
+FPGA 内部 dma_addr0 应该等于 low32=0xAAAAAAAA
+不是 written=0xBBBBBBBB
+```
+
+注意：这一步会写非零 DMA 地址，存在真正 DMA 风险。只有下面条件满足后才能做：
+
+```text
+BAR 已确认正确
+STOP 已确认有效
+safe-stop 后地址能清零
+allow_dma_start=0 保护已确认有效
+系统镜像已备份或准备好重刷
+FPGA 端正在抓 ILA/SignalTap
+```
+
+然后才允许短时间测试：
+
+```sh
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 allow_dma_start=1 frame_wait_ms=100
+sudo ./build/pcie_color_rx --safe-stop
+sudo ./build/pcie_color_rx --once --output /tmp/frame_addr_test.rgb565
+sudo rmmod colorbar_pcie_driver
+```
+
+这一步的目的不是看图像，而是让 FPGA 抓到 `dma_addr0..3`，确认地址字节序。
+
+### 8. 第六步：确认 STOP/remove 后不会留下旧地址
+
+真正启动过一次 DMA 后，卸载驱动前后都要确认 FPGA 地址被清掉。
+
+Linux 侧：
+
+```sh
+sudo ./build/pcie_color_rx --safe-stop
+sudo rmmod colorbar_pcie_driver
+```
+
+FPGA 端确认：
+
+```text
+dma_addr0 = 0
+dma_addr1 = 0
+dma_addr2 = 0
+dma_addr3 = 0
+rc_cfg_ep_flag = 0
+dma_start = 0
+```
+
+然后重新 insmod 安全模式：
+
+```sh
+sudo insmod driver/colorbar_pcie_driver.ko bar=1 addr_byteswap=1 frame_wait_ms=100
+sudo ./build/pcie_color_rx --once --output /tmp/frame_test.rgb565
+```
+
+预期仍然：
+
+```text
+COLORBAR_IOC_START: Operation not permitted
+```
+
+如果这一步也安全，说明旧地址残留问题基本被 Linux 侧控制住。
+
+### 9. 需要调试的问题总表
+
+| 优先级 | 问题 | Linux 看什么 | FPGA 看什么 | 通过标准 |
+| --- | --- | --- | --- | --- |
+| P0 | BAR 是否正确 | `insmod bar=1/bar=0`、`dmesg` | `cmd_reg_addr=0x130`、`dma_stop_flag` | 写 STOP 时 FPGA 有响应 |
+| P0 | STOP 是否有效 | `--safe-stop` 返回成功 | `dma_addr0..3=0`、`rc_cfg_ep_flag=0` | FPGA 清地址、停状态机 |
+| P0 | 不加 allow_dma_start 是否安全 | `--once` 返回 `EPERM` | `dma_start=0`、无 MWR | 不启动 DMA |
+| P1 | addr_byteswap 是否正确 | `dmesg` 的 `low32/written` | `dma_addr0..3` | FPGA 地址等于 Linux low32 |
+| P1 | remove 是否清旧地址 | `rmmod` 后无异常 | `dma_addr0..3=0` | 下次 insmod 不继承旧地址 |
+| P2 | frame_wait_ms 是否够 | raw 文件稳定性 | `frame_done/dma_cnt` | 不半帧、不错页 |
+| P2 | 图像格式是否正确 | `--validate` 采样点 | FPGA 输出 RGB565 | 8 色采样 OK |
+
+### 10. 当前不要调试什么
+
+这些先不要碰：
+
+```text
+不要先调彩条颜色
+不要先调实时显示
+不要先调 framebuffer/DRM/V4L2
+不要反复盲试 bar=0/1 + allow_dma_start=1
+不要反复盲试 addr_byteswap=0/1 + allow_dma_start=1
+```
+
+原因：
+
+```text
+BAR、STOP、清地址、安全闸门没确认前，启动 DMA 仍可能写坏系统。
+```
+
+### 11. 最终判断顺序
+
+按这个顺序打勾：
+
+```text
+[ ] Linux 能枚举 0755:0755
+[ ] Linux 能加载 colorbar_pcie_driver
+[ ] Linux 能创建 /dev/colorbar_pcie_rx
+[ ] bar=1 或 bar=0 已确认能触发 FPGA dma_stop_flag
+[ ] --safe-stop 后 dma_addr0..3 清零
+[ ] allow_dma_start=0 时 --once 被拒绝，FPGA 不 DMA
+[ ] addr_byteswap=1 时 FPGA dma_addr0..3 等于 Linux low32
+[ ] remove/rmmod 后 FPGA 地址仍清零
+[ ] allow_dma_start=1 后能保存一帧 raw
+[ ] --validate 全部 OK
+```
+
+前 8 项没有完成前，不进入真正采集和图像验证。

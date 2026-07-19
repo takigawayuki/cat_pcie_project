@@ -44,6 +44,10 @@ static bool addr_byteswap = true;
 module_param(addr_byteswap, bool, 0644);
 MODULE_PARM_DESC(addr_byteswap, "byteswap 32-bit DMA address before writing BAR+0x110");
 
+static bool allow_dma_start;
+module_param(allow_dma_start, bool, 0644);
+MODULE_PARM_DESC(allow_dma_start, "allow COLORBAR_IOC_START to program FPGA DMA addresses; default is false for safety");
+
 static uint frame_wait_ms = 100;
 module_param(frame_wait_ms, uint, 0644);
 MODULE_PARM_DESC(frame_wait_ms, "temporary wait time for one frame until FPGA frame-done status is available");
@@ -111,7 +115,30 @@ static void colorbar_write_dma_addr(struct colorbar_device *cdev, dma_addr_t dma
 	u32 addr = lower_32_bits(dma_addr);
 	u32 value = addr_byteswap ? swab32(addr) : addr;
 
+	dev_info(&cdev->pdev->dev,
+		 "program DMA address: dma=%pad low32=0x%08x written=0x%08x addr_byteswap=%d\n",
+		 &dma_addr, addr, value, addr_byteswap);
 	iowrite32(value, cdev->bar + COLORBAR_REG_DMA_ADDR);
+}
+
+
+static void colorbar_hw_safe_stop(struct colorbar_device *cdev)
+{
+	int i;
+
+	if (!cdev->bar)
+		return;
+
+	iowrite32(0, cdev->bar + COLORBAR_REG_DMA_STOP);
+	wmb();
+	for (i = 0; i < COLORBAR_BUFFER_COUNT; i++)
+		iowrite32(0, cdev->bar + COLORBAR_REG_DMA_ADDR);
+	wmb();
+	cdev->started = false;
+
+	dev_info(&cdev->pdev->dev,
+		 "sent DMA STOP + cleared dma_addr0..3 on BAR%d\n",
+		 cdev->bar_index);
 }
 
 static int colorbar_start_locked(struct colorbar_device *cdev)
@@ -120,6 +147,12 @@ static int colorbar_start_locked(struct colorbar_device *cdev)
 
 	if (!cdev->bufs_allocated)
 		return -EINVAL;
+
+	if (!allow_dma_start) {
+		dev_err(&cdev->pdev->dev,
+			"refuse to start FPGA DMA: reload with allow_dma_start=1 after BAR/address byte order is verified\n");
+		return -EPERM;
+	}
 
 	for (i = 0; i < COLORBAR_BUFFER_COUNT; i++)
 		memset(cdev->bufs[i].cpu_addr, 0, COLORBAR_BUFFER_SIZE);
@@ -132,19 +165,14 @@ static int colorbar_start_locked(struct colorbar_device *cdev)
 	cdev->frame_counter = 0;
 
 	dev_info(&cdev->pdev->dev,
-		 "started colorbar RX, addr_byteswap=%d, wait_ms=%u\n",
-		 addr_byteswap, frame_wait_ms);
+		 "started colorbar RX, addr_byteswap=%d, allow_dma_start=%d, wait_ms=%u\n",
+		 addr_byteswap, allow_dma_start, frame_wait_ms);
 	return 0;
 }
 
 static void colorbar_stop_locked(struct colorbar_device *cdev)
 {
-	if (!cdev->bar)
-		return;
-
-	iowrite32(0, cdev->bar + COLORBAR_REG_DMA_STOP);
-	wmb();
-	cdev->started = false;
+	colorbar_hw_safe_stop(cdev);
 }
 
 static long colorbar_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
@@ -210,6 +238,12 @@ static long colorbar_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 		mutex_lock(&cdev->lock);
 		colorbar_stop_locked(cdev);
 		colorbar_free_buffers_locked(cdev);
+		mutex_unlock(&cdev->lock);
+		return 0;
+
+	case COLORBAR_IOC_SAFE_STOP:
+		mutex_lock(&cdev->lock);
+		colorbar_hw_safe_stop(cdev);
 		mutex_unlock(&cdev->lock);
 		return 0;
 
@@ -290,8 +324,6 @@ static int colorbar_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto disable_device;
 	}
 
-	pci_set_master(pdev);
-
 	if (bar < 0 || bar > 5) {
 		ret = -EINVAL;
 		goto disable_device;
@@ -319,6 +351,15 @@ static int colorbar_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto free_cdev;
 	}
 
+	/*
+	 * 安全保护：先不要打开 Bus Master。
+	 * pci_enable_device_mem() 允许主机 MMIO 写 BAR，但不需要 FPGA
+	 * 具备主动 DMA 能力。先 STOP/清旧地址，再 pci_set_master()，
+	 * 避免 FPGA 在 probe 窗口期用旧 dma_addr 自动 MWR。
+	 */
+	colorbar_hw_safe_stop(cdev);
+	pci_set_master(pdev);
+
 	pci_set_drvdata(pdev, cdev);
 	g_cdev = cdev;
 
@@ -344,6 +385,7 @@ static void colorbar_remove(struct pci_dev *pdev)
 
 	mutex_lock(&cdev->lock);
 	colorbar_stop_locked(cdev);
+	pci_clear_master(pdev);
 	colorbar_free_buffers_locked(cdev);
 	mutex_unlock(&cdev->lock);
 

@@ -36,6 +36,7 @@ static void print_usage(const char *prog)
     printf("Usage:\n");
     printf("  %s --info\n", prog);
     printf("  %s --validate <frame.rgb565>\n", prog);
+    printf("  %s --safe-stop [--device %s]\n", prog, COLORBAR_DEVICE_PATH);
     printf("  %s --once --output <frame.rgb565> [--device %s]\n", prog, COLORBAR_DEVICE_PATH);
 }
 
@@ -126,6 +127,26 @@ static int validate_file(const char *path)
     munmap(data, (size_t)st.st_size);
     close(fd);
     return ret;
+}
+
+static int safe_stop_device(const char *device)
+{
+    int dev_fd = open(device, O_RDWR);
+
+    if (dev_fd < 0) {
+        perror("open device");
+        return -1;
+    }
+
+    if (ioctl(dev_fd, COLORBAR_IOC_SAFE_STOP) < 0) {
+        perror("COLORBAR_IOC_SAFE_STOP");
+        close(dev_fd);
+        return -1;
+    }
+
+    close(dev_fd);
+    printf("sent safe stop to %s\n", device);
+    return 0;
 }
 
 static int write_all(int fd, const uint8_t *data, size_t len)
@@ -240,6 +261,7 @@ int main(int argc, char **argv)
     const char *validate_path = NULL;
     const char *output_path = NULL;
     bool show_info = false;
+    bool safe_stop = false;
     bool once = false;
     int i;
 
@@ -256,6 +278,8 @@ int main(int argc, char **argv)
             show_info = true;
         } else if (!strcmp(argv[i], "--validate") && i + 1 < argc) {
             validate_path = argv[++i];
+        } else if (!strcmp(argv[i], "--safe-stop")) {
+            safe_stop = true;
         } else if (!strcmp(argv[i], "--once")) {
             once = true;
         } else if (!strcmp(argv[i], "--output") && i + 1 < argc) {
@@ -275,6 +299,10 @@ int main(int argc, char **argv)
 
     if (validate_path) {
         return validate_file(validate_path) == 0 ? 0 : 1;
+    }
+
+    if (safe_stop) {
+        return safe_stop_device(device) == 0 ? 0 : 1;
     }
 
     if (once) {
