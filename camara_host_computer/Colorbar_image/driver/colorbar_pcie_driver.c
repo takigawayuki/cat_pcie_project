@@ -118,9 +118,9 @@ static void colorbar_free_buffers_locked(struct colorbar_device *cdev)
 
 	for (i = 0; i < COLORBAR_BUFFER_COUNT; i++) {
 		if (cdev->bufs[i].cpu_addr) {
-			pci_free_consistent(cdev->pdev, buffer_size,
-					    cdev->bufs[i].cpu_addr,
-					    cdev->bufs[i].dma_addr);
+			dma_free_coherent(&cdev->pdev->dev, buffer_size,
+					  cdev->bufs[i].cpu_addr,
+					  cdev->bufs[i].dma_addr);
 			cdev->bufs[i].cpu_addr = NULL;
 			cdev->bufs[i].dma_addr = 0;
 		}
@@ -156,11 +156,16 @@ static int colorbar_alloc_buffers_locked(struct colorbar_device *cdev)
 	cdev->buffer_size = buffer_size;
 
 	for (i = 0; i < COLORBAR_BUFFER_COUNT; i++) {
-		cdev->bufs[i].cpu_addr = pci_alloc_consistent(cdev->pdev,
+		cdev->bufs[i].cpu_addr = dma_alloc_coherent(&cdev->pdev->dev,
 							 buffer_size,
-							 &cdev->bufs[i].dma_addr);
-		if (!cdev->bufs[i].cpu_addr)
+							 &cdev->bufs[i].dma_addr,
+							 GFP_KERNEL);
+		if (!cdev->bufs[i].cpu_addr) {
+			dev_err(&cdev->pdev->dev,
+				"failed to allocate coherent DMA buffer%d size=%zu requested_len=%u; check CMA/free contiguous DMA memory\n",
+				i, buffer_size, dma_len_bytes);
 			goto fail;
+		}
 
 		if (upper_32_bits(cdev->bufs[i].dma_addr)) {
 			dev_err(&cdev->pdev->dev,

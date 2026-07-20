@@ -2431,3 +2431,244 @@ sudo dmesg | tail -n 160
 ./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=64
 ./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=4096
 ```
+
+## 2026-07-20：单 buffer 仍 Cannot allocate memory 的进一步修正
+
+### 1. 本次现象
+
+即使 Linux 已经改成：
+
+```text
+COLORBAR_BUFFER_COUNT = 1
+```
+
+安全检查仍返回：
+
+```text
+COLORBAR_IOC_ALLOC_BUFS: Cannot allocate memory
+```
+
+说明不是 4 个 buffer 总量太大的问题，而是连单个约 4.15MB coherent DMA buffer 都没有申请成功。
+
+### 2. 新发现的 Linux 内核原因
+
+当前 RK3568 内核头文件中：
+
+```text
+pci_alloc_consistent()
+```
+
+实际使用的是：
+
+```text
+dma_alloc_coherent(..., GFP_ATOMIC)
+```
+
+`GFP_ATOMIC` 更适合不能睡眠的原子上下文，不适合在 ioctl 中申请 4MB 级别的大块 DMA buffer。当前分配发生在用户态 ioctl 调用路径，可以睡眠，所以更合适的是：
+
+```text
+dma_alloc_coherent(..., GFP_KERNEL)
+```
+
+### 3. Linux 驱动已修改
+
+已把 DMA buffer 分配从：
+
+```text
+pci_alloc_consistent()
+```
+
+改为：
+
+```text
+dma_alloc_coherent(&pdev->dev, size, &dma_addr, GFP_KERNEL)
+```
+
+释放对应改为：
+
+```text
+dma_free_coherent()
+```
+
+同时分配失败时会打印更明确的日志：
+
+```text
+failed to allocate coherent DMA buffer0 size=4149248 requested_len=4147264; check CMA/free contiguous DMA memory
+```
+
+### 4. 重新测试命令
+
+重新编译：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo make
+```
+
+重新做安全检查，不允许 START：
+
+```sh
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+./scripts/load_driver.sh dma_len_bytes=4147264
+sudo ./build/pcie_color_rx --once --output /tmp/should_not_start_test8.bin
+sudo dmesg | tail -n 140
+```
+
+预期：
+
+```text
+buffer0 ... size=4149248 requested_len=4147264
+COLORBAR_IOC_START: Operation not permitted
+```
+
+如果仍然 `Cannot allocate memory`，下一步不应该继续改 DMA 逻辑，而应检查系统 CMA/连续 DMA 内存：
+
+```sh
+dmesg | grep -i cma
+cat /proc/meminfo | grep -i cma
+free -h
+```
+
+如果 `CmaFree` 很小或没有 CMA，需要考虑增加内核启动参数或设备树中的 CMA 预留，例如预留 32MB/64MB 以上。具体参数要按鲁班猫当前启动方式调整。
+
+## 2026-07-20：PCIE_DMA_safe_test_9 单大 buffer 整帧方案
+
+### 1. FPGA test_9 改动摘要
+
+当前 FPGA 参考工程更新为：
+
+```text
+PCIE_DMA_safe_test_9
+```
+
+FPGA 侧已按“鲁班猫只拿一个大 buffer”修改：
+
+```text
+dma_start_addr_valid = dma_addr0_valid
+alloc_addrl <= dma_addr0
+```
+
+含义：
+
+```text
+整帧 DMA 启动合法性只要求 dma_addr0 非 0 且 4 字节对齐。
+整帧发送首地址固定使用 dma_addr0。
+不再要求 dma_addr1..3 都是独立大 buffer。
+不会再按 addr_page 在 dma_addr0..3 间轮换。
+```
+
+### 2. Linux 侧是否需要再改代码
+
+当前 Linux 侧已经匹配 test_9，不需要再改代码。
+
+当前 Linux 行为：
+
+```text
+COLORBAR_BUFFER_COUNT = 1
+只申请 1 个 coherent DMA 大 buffer。
+buffer0 size 应为 4149248，requested_len 为 4147264。
+写 FPGA 地址寄存器时仍写 4 次，但 4 次都是 buffer0 地址。
+```
+
+这和 test_9 的要求一致：
+
+```text
+FPGA 只看 dma_addr0。
+Linux 保证 buffer0 足够大。
+```
+
+### 3. test_9 预期 STATUS
+
+烧录 test_9 后，START 前理想状态类似：
+
+```text
+0x00000350
+```
+
+含义：
+
+```text
+len_valid=1
+start_addr_valid=1
+arm=1
+pcie_dma_enable=1
+fixed_test=0
+```
+
+START 后可能看到类似：
+
+```text
+0x00000374
+0x000003f5
+0x00000342
+```
+
+重点不是死盯某一个 raw 值，而是看字段：
+
+```text
+start_addr_valid=1
+len_valid=1
+addr_error=0
+start_cmd_seen=1
+host_start=1 或 done=1
+```
+
+如果仍然看到：
+
+```text
+start_addr_valid=0
+```
+
+说明：
+
+```text
+FPGA 当前运行的可能还不是 test_9。
+或者 dma_addr0 没真正写进当前 RTL。
+或者 ADDR_ECHO0 读回和 START 判断使用的不是同一份 dma_addr0。
+```
+
+### 4. test_9 安全测试命令
+
+先确认安全闸门和 buffer0 分配：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+./scripts/load_driver.sh dma_len_bytes=4147264
+sudo ./build/pcie_color_rx --once --output /tmp/should_not_start_test9.bin
+sudo dmesg | tail -n 140
+```
+
+预期：
+
+```text
+COLORBAR_IOC_START: Operation not permitted
+buffer0 ... size=4149248 requested_len=4147264
+```
+
+确认 buffer0 成功后，才允许真实 DMA：
+
+```sh
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=4147264
+sudo ./build/pcie_color_rx --once --output /tmp/frame_full_test9.rgb565
+hexdump -C /tmp/frame_full_test9.rgb565 | head
+ls -lh /tmp/frame_full_test9.rgb565
+sudo dmesg | tail -n 180
+```
+
+输出文件大小应为：
+
+```text
+4147264 bytes
+```
+
+如果文件仍然全是：
+
+```text
+cd cd cd cd ...
+```
+
+说明 FPGA 仍未把 MWr 数据写进 Linux buffer。
+
+如果文件不是全 cd，但彩条校验失败，则继续分析图像格式、字节序、行宽、帧尾 64B 标记区和 FPGA 发送内容。
