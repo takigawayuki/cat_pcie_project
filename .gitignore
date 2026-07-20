@@ -19,6 +19,7 @@ Thumbs.db
 pcie_test_platform_v1_0.zip
 PCIE_DMA_test_color_MES50HP_X1_backup/
 PCIE_DMA_safe_test_8/
+PCIE_DMA_safe_test_9/
 
 # Linux kernel module build outputs
 *.o
