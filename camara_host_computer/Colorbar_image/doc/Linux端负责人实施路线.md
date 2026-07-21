@@ -2672,3 +2672,239 @@ cd cd cd cd ...
 说明 FPGA 仍未把 MWr 数据写进 Linux buffer。
 
 如果文件不是全 cd，但彩条校验失败，则继续分析图像格式、字节序、行宽、帧尾 64B 标记区和 FPGA 发送内容。
+
+
+## 2026-7-21 PCIE_DMA_single_1：Linux 端适配记录
+
+### 1. 本次 FPGA 协议变化
+
+`PCIE_DMA_single_1` 已经不是 test_8/test_9 的协议。Linux 端从这一节开始不要再使用 `4147264` 和 4 地址轮转思路。
+
+新的 FPGA 协议要点：
+
+```text
+DMA buffer 数量：1
+DMA buffer 分配大小：4 MiB = 4194304 bytes
+有效图像长度：4147200 bytes = 1920 * 1080 * 2
+保护区长度：47104 bytes = 4194304 - 4147200
+每个 MWr TLP：64 bytes
+每帧 TLP 数：64800
+帧尾额外 64B marker：已取消
+```
+
+寄存器协议：
+
+```text
+0x100 ARM   = 0xA55A5AA5
+0x104 START = 非零启动一帧
+0x108 LEN   = 必须写 4147200
+0x110 ADDR  = 一个 32-bit DMA 地址
+0x114 ADDR_ECHO0
+0x130 STOP
+0x170 STATUS
+0x174 ACTIVE_ADDR
+0x178 ACTIVE_LEN
+0x17c BYTES_SENT
+```
+
+### 2. Linux 端已修改内容
+
+本次已修改：
+
+```text
+camara_host_computer/Colorbar_image/driver/colorbar_pcie_driver.h
+camara_host_computer/Colorbar_image/driver/colorbar_pcie_driver.c
+camara_host_computer/Colorbar_image/include/colorbar_pcie_rx.h
+camara_host_computer/Colorbar_image/src/pcie_color_rx.c
+camara_host_computer/Colorbar_image/scripts/load_driver.sh
+```
+
+核心修改：
+
+```text
+1. dma_len_bytes 默认改为 4147200，并且只允许等于 4147200。
+2. DMA buffer 固定申请 4MiB，不再按 4147264 或 PAGE_ALIGN(4147264) 申请。
+3. 只使用 buffer0，一个 coherent DMA buffer。
+4. 只写 0x110 一个 DMA 地址。
+5. 只读 0x114 ADDR_ECHO0 做地址回读确认。
+6. STATUS 改为解析 PCIE_DMA_single_1 的新格式，版本号必须是 0x0A。
+7. START 前必须检查：IDLE=1、ARM=1、ADDR_VALID=1、LEN_VALID=1、BUSY=0、无错误。
+8. START 前才打开 Bus Master，并等待 STATUS bit8 bus_master_seen=1。
+9. START 后不再固定睡眠当作成功，而是轮询 DONE+IDLE。
+10. DONE 后读取 0x174/0x178/0x17c，确认实际地址、实际长度、实际发送字节数。
+11. 检查 buffer 尾部 47104 bytes guard 区是否仍为 0xA5。
+12. 用户态输出文件只保存 4147200 bytes 有效 RGB565 图像。
+13. STOP 只写 0x130，不再向 0x110 写 0，避免新 FPGA 把清零地址判成 addr_error。
+```
+
+### 3. 新 STATUS 判断方式
+
+新 STATUS 不是旧 test_9 的字段。现在驱动日志会打印：
+
+```text
+version=0x0a
+rc_cfg_ep
+host_start
+stop_pending
+fifo_underflow
+fifo_overflow
+len_error
+addr_error
+bus_master_seen
+len_valid
+addr_valid
+start_seen
+arm
+stop_ack
+idle
+done
+busy
+```
+
+成功 START 前应该看到：
+
+```text
+version=0x0a
+arm=1
+addr_valid=1
+len_valid=1
+idle=1
+busy=0
+addr_error=0
+len_error=0
+fifo_overflow=0
+fifo_underflow=0
+```
+
+打开 Bus Master 后应该看到：
+
+```text
+bus_master_seen=1
+```
+
+一帧成功完成后应该看到：
+
+```text
+done=1
+idle=1
+busy=0
+```
+
+并且驱动日志应该有：
+
+```text
+DMA result: active_addr=... expected_addr=... active_len=4147200 bytes_sent=4147200
+DMA guard intact: [4147200, 4194304) size=47104 pattern=0xa5
+```
+
+### 4. 安全测试命令
+
+先只验证默认安全闸门，不允许 START：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+./scripts/load_driver.sh
+sudo ./build/pcie_color_rx --once --output /tmp/should_not_start_single1.bin
+sudo dmesg | tail -n 160
+```
+
+预期现象：
+
+```text
+COLORBAR_IOC_START: Operation not permitted
+buffer0 ... size=4194304 frame_len=4147200 guard=47104
+```
+
+这一步如果不是 `Operation not permitted`，不要继续真实 DMA。
+
+确认安全闸门有效后，再允许真实 DMA：
+
+```sh
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+./scripts/load_driver.sh allow_dma_start=1
+sudo ./build/pcie_color_rx --once --output /tmp/frame_single1.rgb565
+ls -lh /tmp/frame_single1.rgb565
+hexdump -C /tmp/frame_single1.rgb565 | head
+sudo dmesg | tail -n 220
+```
+
+预期输出文件大小：
+
+```text
+4147200 bytes
+```
+
+预期驱动日志重点：
+
+```text
+read STATUS ... version=0x0a
+read ADDR_ECHO0 decoded=... expected=...
+read STATUS before BusMaster/START ... addr_valid=1 len_valid=1 arm=1 idle=1
+read STATUS for BusMaster visible ... bus_master_seen=1
+read STATUS for frame DONE+IDLE ... done=1 idle=1 busy=0
+DMA result: active_addr=... expected_addr=... active_len=4147200 bytes_sent=4147200
+DMA guard intact: [4147200, 4194304) size=47104 pattern=0xa5
+captured frame_counter=1 buffer=0 bytes=4147200
+```
+
+### 5. 异常结果怎么判断
+
+如果看到：
+
+```text
+STATUS version mismatch
+```
+
+优先怀疑：FPGA 还没有烧 `PCIE_DMA_single_1`，或者 STATUS 回读字节序/BAR 不是当前这版。
+
+如果看到：
+
+```text
+ADDR_ECHO0 mismatch
+```
+
+说明 Linux 写到 `0x110` 的地址和 FPGA `0x114` 保存的地址不一致。先不要 START。重点检查 `addr_byteswap` 和 FPGA `cmd_data` 字节序。
+
+如果看到：
+
+```text
+len_error=1
+len_valid=0
+```
+
+说明 `0x108 LEN` 没有被 FPGA 识别为 `4147200`。检查加载参数是否仍写成旧的 `4147264`，或者是否仍加载了旧驱动。
+
+如果看到：
+
+```text
+bus_master_seen=0
+```
+
+说明 Linux `pci_set_master()` 后 FPGA 没看到 `cfg_bus_master_en`。这时 START 不应该继续。
+
+如果看到：
+
+```text
+timeout waiting for frame DONE+IDLE
+```
+
+说明 FPGA 已经进入启动流程，但没有完成一帧。重点看 FPGA 侧视频时序、VS 边沿、FIFO 水位、AXIS_S_TREADY、MWr TLP 是否真正发出。
+
+如果看到：
+
+```text
+DMA guard overwritten
+```
+
+说明 FPGA 写超过了 4147200 有效图像区域，这是严重越界风险，必须停止测试并回到 FPGA 侧查 TLP 计数和最后一包逻辑。
+
+### 6. 当前建议
+
+当前 Linux 端已经按 `PCIE_DMA_single_1` 改成单 buffer 安全握手。下一次测试必须先跑默认安全闸门，再跑 `allow_dma_start=1`。不要再跑旧命令：
+
+```sh
+./scripts/load_driver.sh allow_dma_start=1 dma_len_bytes=4147264
+```
+
+也不要再跑 64B/4KB 小包测试，因为 `PCIE_DMA_single_1` 的 FPGA 已经固定要求整帧 `4147200`。

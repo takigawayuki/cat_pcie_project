@@ -46,8 +46,8 @@ static void print_info(void)
     printf("  resolution      : %ux%u\n", COLORBAR_WIDTH, COLORBAR_HEIGHT);
     printf("  format          : RGB565\n");
     printf("  frame_size      : %u bytes\n", COLORBAR_FRAME_SIZE);
-    printf("  mark_size       : %u bytes\n", COLORBAR_MARK_SIZE);
-    printf("  dma_max_bytes   : %u bytes\n", COLORBAR_DMA_MAX_BYTES);
+    printf("  valid_frame     : %u bytes\n", COLORBAR_DMA_MAX_BYTES);
+    printf("  dma_guard       : %u bytes\n", COLORBAR_DMA_GUARD_SIZE);
     printf("  buffer_count    : %u\n", COLORBAR_BUFFER_COUNT);
     printf("  buffer_size     : %u bytes\n", COLORBAR_BUFFER_SIZE);
     printf("  default device  : %s\n", COLORBAR_DEVICE_PATH);
@@ -69,9 +69,9 @@ static int validate_buffer(const uint8_t *data, size_t size)
         return -1;
     }
 
-    if (size != COLORBAR_FRAME_SIZE && size != COLORBAR_FRAME_SIZE + COLORBAR_MARK_SIZE) {
-        printf("warning: file size is %zu bytes; expected %u or %u bytes\n",
-               size, COLORBAR_FRAME_SIZE, COLORBAR_FRAME_SIZE + COLORBAR_MARK_SIZE);
+    if (size != COLORBAR_FRAME_SIZE) {
+        printf("warning: file size is %zu bytes; expected %u bytes\n",
+               size, COLORBAR_FRAME_SIZE);
     }
 
     for (i = 0; i < sizeof(k_samples) / sizeof(k_samples[0]); i++) {
@@ -217,7 +217,7 @@ static int capture_once(const char *device, const char *output)
 
     if (ioctl(dev_fd, COLORBAR_IOC_ALLOC_BUFS) < 0) {
         perror("COLORBAR_IOC_ALLOC_BUFS");
-        fprintf(stderr, "DMA buffer allocation failed; reload the driver with a smaller dma_len_bytes, for example: ./scripts/load_driver.sh dma_len_bytes=64\n");
+        fprintf(stderr, "DMA buffer allocation failed; PCIE_DMA_single_1 needs one 4MiB coherent DMA buffer and dma_len_bytes=4147200\n");
         goto out;
     }
 

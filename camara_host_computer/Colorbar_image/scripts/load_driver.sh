@@ -26,10 +26,10 @@ if ! has_param addr_byteswap "$@"; then
     PARAMS="$PARAMS addr_byteswap=1"
 fi
 if ! has_param frame_wait_ms "$@"; then
-    PARAMS="$PARAMS frame_wait_ms=100"
+    PARAMS="$PARAMS frame_wait_ms=1000"
 fi
 if ! has_param dma_len_bytes "$@"; then
-    PARAMS="$PARAMS dma_len_bytes=4147264"
+    PARAMS="$PARAMS dma_len_bytes=4147200"
 fi
 if ! has_param verify_readback "$@"; then
     PARAMS="$PARAMS verify_readback=1"
