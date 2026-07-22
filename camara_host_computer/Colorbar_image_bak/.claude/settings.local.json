@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//y/cat_pcie_project/camara_host_computer/**)"
+    ]
+  }
+}
