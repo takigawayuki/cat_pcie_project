@@ -2908,3 +2908,524 @@ DMA guard overwritten
 ```
 
 也不要再跑 64B/4KB 小包测试，因为 `PCIE_DMA_single_1` 的 FPGA 已经固定要求整帧 `4147200`。
+
+
+## 2026-7-22 PCIE_DMA_single_1：寄存器字节序修正
+
+### 1. 本次失败日志结论
+
+这次真实 DMA 命令返回：
+
+```text
+COLORBAR_IOC_START: Input/output error
+```
+
+驱动日志关键行：
+
+```text
+program DMA address: dma=0x00000000eef00000 low32=0xeef00000 written=0x0000f0ee addr_byteswap=1
+program DMA command: offset=0x108 value=0x003f4800 written=0x00483f00
+read STATUS before BusMaster/START: raw=0x0a000614 ... len_error=1 addr_error=1 len_valid=0 addr_valid=0 arm=1 idle=1 busy=0
+refuse to start FPGA DMA
+```
+
+判断：
+
+```text
+FPGA STATUS version=0x0A，说明读到的是 PCIE_DMA_single_1 新状态寄存器。
+Linux 已经申请到 4MiB buffer。
+Linux 写了 ARM、ADDR、LEN。
+驱动在 START 前看到 addr_error=1、len_error=1，因此拒绝 START。
+没有真正启动 DMA，没有写 host 内存。
+```
+
+失败原因集中在 BAR 控制寄存器字节序：Linux 软件提前 `swab32()`，FPGA 数据通路内部又做了一次字节翻转，导致 FPGA 内部用于合法性判断的值变成：
+
+```text
+ADDR = 0x0000f0ee  不是 64B 对齐，所以 addr_error=1
+LEN  = 0x00483f00  不是 4147200，所以 len_error=1
+```
+
+`ADDR_ECHO0` 曾经看起来匹配，是因为回读路径和驱动解码再次发生字节排列变化；它不能单独证明 FPGA 内部合法性判断用的是正确地址。当前最可信的是 STATUS 里的：
+
+```text
+addr_valid
+len_valid
+addr_error
+len_error
+```
+
+### 2. Linux 端已修改内容
+
+本次驱动新增 3 个字节序参数：
+
+```text
+cmd_byteswap       控制 ARM/LEN/START 这类命令值写 BAR 前是否 swab32
+addr_byteswap      控制 DMA 地址写 0x110 前是否 swab32
+readback_byteswap  控制 0x114/0x174/0x178/0x17c 回读后是否 swab32
+```
+
+`PCIE_DMA_single_1` 当前默认值改为：
+
+```text
+cmd_byteswap=0
+addr_byteswap=0
+readback_byteswap=0
+```
+
+也就是 Linux 直接写原值：
+
+```text
+ARM   0xa55a5aa5
+ADDR  0xeef00000  示例，实际以驱动分配地址为准
+LEN   0x003f4800
+START 0x00000001
+```
+
+加载脚本 `scripts/load_driver.sh` 已同步默认参数。
+
+### 3. 当前测试命令
+
+先验证默认安全闸门，不允许 START：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+./scripts/load_driver.sh
+sudo ./build/pcie_color_rx --once --output /tmp/should_not_start_single1.bin
+sudo dmesg | tail -n 180
+```
+
+预期：
+
+```text
+COLORBAR_IOC_START: Operation not permitted
+loaded params: ... cmd_byteswap=0 addr_byteswap=0 readback_byteswap=0 ... dma_len_bytes=4147200
+```
+
+再允许真实 DMA：
+
+```sh
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+./scripts/load_driver.sh allow_dma_start=1
+sudo ./build/pcie_color_rx --once --output /tmp/frame_single1.rgb565
+ls -lh /tmp/frame_single1.rgb565
+hexdump -C /tmp/frame_single1.rgb565 | head
+sudo dmesg | tail -n 240
+```
+
+START 前理想 STATUS 字段：
+
+```text
+version=0x0a
+arm=1
+addr_valid=1
+len_valid=1
+idle=1
+busy=0
+addr_error=0
+len_error=0
+```
+
+如果用 raw 值粗略看，常见可能是：
+
+```text
+0x0a0000d4  未打开 Bus Master 前
+0x0a0001d4  打开 Bus Master 后
+```
+
+但驱动不要按完整 raw 值相等判断，只按位判断。
+
+### 4. 如果仍失败
+
+如果仍看到：
+
+```text
+ADDR_ECHO0 mismatch
+```
+
+先不要启动 DMA。可以只在下一轮临时测试：
+
+```sh
+./scripts/load_driver.sh allow_dma_start=1 readback_byteswap=1
+```
+
+如果 `ADDR_ECHO0` 变匹配，但 STATUS 仍然 `addr_valid=1 len_valid=1`，说明只是回读显示路径需要翻转，写路径不需要翻转。
+
+如果仍看到：
+
+```text
+addr_error=1
+len_error=1
+addr_valid=0
+len_valid=0
+```
+
+则说明 FPGA 内部实际保存的 ADDR/LEN 仍不对，需要 FPGA 侧抓 `cmd_data`、`dma_addr0`、`dma_len_bytes` 三个信号，而不是只看回读值。
+
+如果看到：
+
+```text
+addr_valid=1
+len_valid=1
+bus_master_seen=1
+start_seen=1
+```
+
+但之后没有 `done=1`，问题才进入视频/FIFO/MWr 发送阶段。
+
+
+## 2026-7-22 PCIE_DMA_single_1：DONE 超时后的发送进度诊断
+
+### 1. 本次超时日志结论
+
+字节序修正后，START 前状态已经正确：
+
+```text
+ADDR written=0xeef00000 addr_byteswap=0
+LEN  written=0x003f4800 cmd_byteswap=0
+STATUS before BusMaster/START: raw=0x0a0000d4 ... addr_valid=1 len_valid=1 addr_error=0 len_error=0 arm=1 idle=1 busy=0
+STATUS for BusMaster visible: raw=0x0a0001d4 ... bus_master_seen=1
+START written=0x00000001
+```
+
+START 后状态长期保持：
+
+```text
+raw=0x0a00c1f1
+rc_cfg_ep=1
+host_start=1
+start_seen=1
+arm=1
+bus_master_seen=1
+addr_valid=1
+len_valid=1
+busy=1
+idle=0
+done=0
+fifo_underflow=0
+fifo_overflow=0
+addr_error=0
+len_error=0
+```
+
+这说明 Linux 侧寄存器配置、DMA 地址、LEN、Bus Master、START 已经通过。当前问题进入 FPGA 数据发送阶段：FPGA 进入 busy，但没有在超时时间内完成整帧并置 DONE。
+
+### 2. Linux 端已增加的诊断
+
+驱动已修改：当等待 `DONE+IDLE` 超时时，也会读取并打印：
+
+```text
+0x174 ACTIVE_ADDR
+0x178 ACTIVE_LEN
+0x17c BYTES_SENT
+```
+
+日志格式类似：
+
+```text
+DMA progress after timeout: active_addr=0x... active_len=4147200 bytes_sent=... bytes_sent_hex=0x... remaining=...
+```
+
+用户态提示也改成：
+
+```text
+FPGA DMA did not report DONE before the driver timeout; check dmesg for ACTIVE_ADDR/ACTIVE_LEN/BYTES_SENT
+```
+
+### 3. 下一次测试命令
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+./scripts/load_driver.sh allow_dma_start=1
+sudo ./build/pcie_color_rx --once --output /tmp/frame_single1.rgb565
+sudo dmesg | tail -n 260
+```
+
+### 4. BYTES_SENT 判断方法
+
+重点看：
+
+```text
+bytes_sent
+bytes_sent_hex
+remaining
+```
+
+如果：
+
+```text
+bytes_sent=0
+```
+
+说明一个 MWr TLP 都没有发出。FPGA 侧优先检查：
+
+```text
+VS 边沿是否出现
+DE 是否有效
+FIFO 是否写入数据
+rd_water_level 是否达到发送门槛
+dma_start 是否被拉起
+mwr_state 是否离开 IDLE
+AXIS_S_TVALID 是否拉起
+```
+
+如果：
+
+```text
+bytes_sent=4147136
+bytes_sent_hex=0x003f47c0
+remaining=64
+```
+
+说明整帧 4147200 字节只差最后 64 字节。此时重点怀疑最后一个 TLP 的启动条件过严。
+
+FPGA 侧建议检查并修改最后一包条件：
+
+```text
+普通包要求 rd_water_level >= TLP_LENGTH/4
+最后一包允许 final_tlp && rd_water_level >= TLP_LENGTH/4 - 1
+```
+
+也就是：
+
+```text
+普通包水位 >= 4
+最后一包水位 >= 3
+```
+
+如果：
+
+```text
+0 < bytes_sent < 4147136
+```
+
+说明已经发出一部分 TLP，但中途卡住。FPGA 侧重点检查：
+
+```text
+rd_water_level 是否下降后无法恢复
+AXIS_S_TREADY 是否曾经拉低后没有恢复
+mwr_tlast 是否正常出现
+dma_cnt 是否继续递增
+FIFO 读写时钟/复位是否异常
+```
+
+如果：
+
+```text
+bytes_sent=4147200
+```
+
+但仍然没有 DONE，则说明数据包数量已经够了，问题集中在 FPGA DONE/IDLE/host_start_flag 清零逻辑，而不是数据发送量本身。
+
+
+## 2026-7-22 图形界面采集程序
+
+### 1. 新增程序
+
+新增 GTK2 图形界面程序：
+
+```text
+src/pcie_color_gui.c
+build/pcie_color_gui
+```
+
+Makefile 已增加 GUI 构建目标，执行：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo make
+```
+
+会同时生成：
+
+```text
+build/pcie_color_rx
+build/pcie_color_gui
+driver/colorbar_pcie_driver.ko
+```
+
+### 2. 驱动新增状态 ioctl
+
+为了让界面显示 DMA 状态，驱动和公共头文件新增：
+
+```text
+COLORBAR_IOC_GET_STATUS
+struct colorbar_status_info
+```
+
+界面可以读取：
+
+```text
+status_raw
+status
+dma_addr_low
+active_addr
+active_len
+bytes_sent
+frame_counter
+```
+
+界面显示字段包括：
+
+```text
+帧号
+帧率
+DMA_ADDR
+ACTIVE_ADDR
+ACTIVE_LEN
+BYTES_SENT
+DONE
+IDLE
+BUSY
+FIFO_OVERFLOW
+FIFO_UNDERFLOW
+运行日志和错误信息
+```
+
+### 3. 界面按钮
+
+界面包含：
+
+```text
+连接设备
+采集一帧
+连续采集
+停止
+保存图片
+RGB565 Little Endian / RGB565 Big Endian 切换
+```
+
+`保存图片` 当前保存为 PNG。
+
+### 4. 单 buffer 采集顺序
+
+GUI 严格按单 buffer 顺序运行：
+
+```text
+START
+→ 等待 DONE+IDLE
+→ 从 /dev/colorbar_pcie_rx 复制 4147200 字节
+→ RGB565 转 RGB888
+→ 显示图像
+→ 连续采集模式下再启动下一帧
+```
+
+不会在当前图像没有复制完成时启动下一帧。
+
+### 5. DMA 成功条件
+
+当前驱动和 GUI 按 FPGA 建议保持严格条件：
+
+```text
+BYTES_SENT = 4147200
+DONE = 1
+IDLE = 1
+BUSY = 0
+FIFO_OVERFLOW = 0
+FIFO_UNDERFLOW = 0
+```
+
+如果 START 失败、WAIT_FRAME 失败或出现错误位，连续采集会立即停止，不会无限自动重试。
+
+### 6. 运行命令
+
+先加载驱动，允许 START：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+./scripts/load_driver.sh allow_dma_start=1
+```
+
+启动图形界面：
+
+```sh
+sudo ./build/pcie_color_gui
+```
+
+如果当前桌面用户无法用 `sudo` 打开图形窗口，可以先尝试：
+
+```sh
+xhost +local:root
+sudo ./build/pcie_color_gui
+```
+
+测试流程：
+
+```text
+1. 点击“连接设备”。
+2. 点击“采集一帧”。
+3. 如果图像颜色不对，切换 RGB565 大小端。
+4. 如果单帧稳定，再点击“连续采集”。
+5. 出错后查看右侧日志和状态字段。
+6. 需要保存当前帧时点击“保存图片”。
+```
+
+### 7. 当前需要重点观察
+
+如果界面日志显示 `WAIT_FRAME failed`，同时状态里：
+
+```text
+BYTES_SENT = 4147200
+DONE = 1
+IDLE = 1
+BUSY = 0
+FIFO_UNDERFLOW = 1
+```
+
+说明图像数据量已经发满，但 FPGA 同时报告 FIFO_UNDERFLOW。按当前严格成功条件，Linux 不会把这一帧显示出来。此时 FPGA 侧需要继续确认最后一包或收尾阶段是否多读 FIFO 一拍。
+
+
+## 2026-7-22 GUI 1080p 固定布局与 IDLE 含义
+
+### 1. GUI 布局修改
+
+图形界面已取消图像滚动条，不再需要拖动滑块查看画面。
+
+当前界面按 1920x1080 桌面设计：
+
+```text
+窗口默认尺寸：1920x1080
+图像预览区域：1440x810
+右侧状态/日志区域：约 450px 宽
+```
+
+注意：FPGA/驱动采集的原始图像仍然是完整的：
+
+```text
+1920x1080 RGB565
+4147200 bytes
+```
+
+界面只是把 1920x1080 图像按 16:9 比例缩放到 1440x810 显示，避免界面出现横向/纵向滚动条。保存图片时仍保存当前帧转换后的 PNG。
+
+### 2. IDLE 一直是 1 表示什么
+
+`IDLE=1` 表示 FPGA DMA 状态机当前处于空闲状态，也就是没有正在发送 DMA TLP。
+
+常见情况：
+
+```text
+刚加载驱动/STOP 后：IDLE=1, BUSY=0, DONE=0
+START 后正在传输：IDLE=0, BUSY=1
+一帧完成后：IDLE=1, BUSY=0, DONE=1
+```
+
+所以如果没有采集，或者采集已经结束，`IDLE=1` 是正常的。
+
+判断一次 DMA 是否成功，不能只看 `IDLE=1`，要同时看：
+
+```text
+DONE=1
+IDLE=1
+BUSY=0
+BYTES_SENT=4147200
+FIFO_OVERFLOW=0
+FIFO_UNDERFLOW=0
+```
+
+如果 `IDLE=1` 但 `DONE=0`，通常只是空闲或 STOP 后状态，不代表已经采到一帧。
+
+如果 `IDLE=1` 且 `DONE=1`，但 `FIFO_UNDERFLOW=1`，说明 FPGA 报告了 FIFO 读空错误。当前 Linux/GUI 仍按错误处理，不默认显示这一帧。

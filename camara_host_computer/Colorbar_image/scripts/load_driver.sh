@@ -22,8 +22,14 @@ PARAMS=""
 if ! has_param bar "$@"; then
     PARAMS="$PARAMS bar=1"
 fi
+if ! has_param cmd_byteswap "$@"; then
+    PARAMS="$PARAMS cmd_byteswap=0"
+fi
 if ! has_param addr_byteswap "$@"; then
-    PARAMS="$PARAMS addr_byteswap=1"
+    PARAMS="$PARAMS addr_byteswap=0"
+fi
+if ! has_param readback_byteswap "$@"; then
+    PARAMS="$PARAMS readback_byteswap=0"
 fi
 if ! has_param frame_wait_ms "$@"; then
     PARAMS="$PARAMS frame_wait_ms=1000"

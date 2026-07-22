@@ -36,6 +36,17 @@ struct colorbar_frame_info {
     uint32_t flags;
 };
 
+struct colorbar_status_info {
+    uint32_t status_raw;
+    uint32_t status;
+    uint32_t dma_addr_low;
+    uint32_t active_addr;
+    uint32_t active_len;
+    uint32_t bytes_sent;
+    uint32_t frame_counter;
+    uint32_t flags;
+};
+
 #define COLORBAR_IOC_GET_INFO _IOR(COLORBAR_IOCTL_MAGIC, 0x00, struct colorbar_rx_info)
 #define COLORBAR_IOC_ALLOC_BUFS _IO(COLORBAR_IOCTL_MAGIC, 0x01)
 #define COLORBAR_IOC_START _IO(COLORBAR_IOCTL_MAGIC, 0x02)
@@ -43,5 +54,6 @@ struct colorbar_frame_info {
 #define COLORBAR_IOC_WAIT_FRAME _IOR(COLORBAR_IOCTL_MAGIC, 0x04, struct colorbar_frame_info)
 #define COLORBAR_IOC_FREE_BUFS _IO(COLORBAR_IOCTL_MAGIC, 0x05)
 #define COLORBAR_IOC_SAFE_STOP _IO(COLORBAR_IOCTL_MAGIC, 0x06)
+#define COLORBAR_IOC_GET_STATUS _IOR(COLORBAR_IOCTL_MAGIC, 0x07, struct colorbar_status_info)
 
 #endif

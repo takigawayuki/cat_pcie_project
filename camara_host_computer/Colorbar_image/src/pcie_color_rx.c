@@ -228,7 +228,7 @@ static int capture_once(const char *device, const char *output)
 
     if (ioctl(dev_fd, COLORBAR_IOC_WAIT_FRAME, &frame) < 0) {
         perror("COLORBAR_IOC_WAIT_FRAME");
-        fprintf(stderr, "frame wait is not available; driver-side frame-ready support is required\n");
+        fprintf(stderr, "FPGA DMA did not report DONE before the driver timeout; check dmesg for ACTIVE_ADDR/ACTIVE_LEN/BYTES_SENT\n");
         goto out_stop;
     }
 

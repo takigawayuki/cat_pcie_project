@@ -50,9 +50,17 @@ static int bar = COLORBAR_BAR_DEFAULT;
 module_param(bar, int, 0444);
 MODULE_PARM_DESC(bar, "FPGA BAR index for colorbar control registers");
 
-static bool addr_byteswap = true;
+static bool cmd_byteswap;
+module_param(cmd_byteswap, bool, 0644);
+MODULE_PARM_DESC(cmd_byteswap, "byteswap 32-bit ARM/LEN/START command values before BAR writes; default false for PCIE_DMA_single_1");
+
+static bool addr_byteswap;
 module_param(addr_byteswap, bool, 0644);
-MODULE_PARM_DESC(addr_byteswap, "byteswap 32-bit DMA address before writing BAR+0x110; default true for PCIE_DMA_single_1 cmd_data byte order");
+MODULE_PARM_DESC(addr_byteswap, "byteswap 32-bit DMA address before writing BAR+0x110; default false for PCIE_DMA_single_1");
+
+static bool readback_byteswap;
+module_param(readback_byteswap, bool, 0644);
+MODULE_PARM_DESC(readback_byteswap, "byteswap 32-bit command/readback registers after BAR reads; default false for PCIE_DMA_single_1");
 
 static bool allow_dma_start;
 module_param(allow_dma_start, bool, 0644);
@@ -204,12 +212,19 @@ static u32 colorbar_ioread32(struct colorbar_device *cdev, u32 offset)
 static u32 colorbar_read_cmd32(struct colorbar_device *cdev, u32 offset)
 {
 	u32 raw = colorbar_ioread32(cdev, offset);
-	u32 value = swab32(raw);
+	u32 value = readback_byteswap ? swab32(raw) : raw;
 
 	dev_info(&cdev->pdev->dev,
-		 "read DMA command: offset=0x%03x raw=0x%08x value=0x%08x\n",
-		 offset, raw, value);
+		 "read DMA command: offset=0x%03x raw=0x%08x value=0x%08x readback_byteswap=%d\n",
+		 offset, raw, value, readback_byteswap);
 	return value;
+}
+
+static u32 colorbar_read_cmd32_quiet(struct colorbar_device *cdev, u32 offset)
+{
+	u32 raw = colorbar_ioread32(cdev, offset);
+
+	return readback_byteswap ? swab32(raw) : raw;
 }
 
 static u32 colorbar_decode_status(u32 raw)
@@ -250,6 +265,26 @@ static u32 colorbar_read_status_locked(struct colorbar_device *cdev, const char 
 		 !!(status & COLORBAR_STATUS_BUSY));
 
 	return status;
+}
+
+static void colorbar_get_status_snapshot_locked(struct colorbar_device *cdev,
+					       struct colorbar_status_info *snapshot)
+{
+	u32 raw = colorbar_ioread32(cdev, COLORBAR_REG_DMA_STATUS);
+
+	memset(snapshot, 0, sizeof(*snapshot));
+	snapshot->status_raw = raw;
+	snapshot->status = colorbar_decode_status(raw);
+	snapshot->dma_addr_low = cdev->bufs_allocated ?
+		lower_32_bits(cdev->bufs[0].dma_addr) : 0;
+	snapshot->active_addr = colorbar_read_cmd32_quiet(cdev,
+						  COLORBAR_REG_DMA_ACTIVE_ADDR);
+	snapshot->active_len = colorbar_read_cmd32_quiet(cdev,
+						 COLORBAR_REG_DMA_ACTIVE_LEN);
+	snapshot->bytes_sent = colorbar_read_cmd32_quiet(cdev,
+						  COLORBAR_REG_DMA_BYTES_SENT);
+	snapshot->frame_counter = cdev->frame_counter;
+	snapshot->flags = 0;
 }
 
 static bool colorbar_status_version_ok(u32 status)
@@ -294,11 +329,11 @@ static int colorbar_wait_status_locked(struct colorbar_device *cdev,
 
 static void colorbar_write_cmd32(struct colorbar_device *cdev, u32 value, u32 offset)
 {
-	u32 written = swab32(value);
+	u32 written = cmd_byteswap ? swab32(value) : value;
 
 	dev_info(&cdev->pdev->dev,
-		 "program DMA command: offset=0x%03x value=0x%08x written=0x%08x\n",
-		 offset, value, written);
+		 "program DMA command: offset=0x%03x value=0x%08x written=0x%08x cmd_byteswap=%d\n",
+		 offset, value, written, cmd_byteswap);
 	colorbar_iowrite32(cdev, written, offset);
 }
 
@@ -408,6 +443,20 @@ static int colorbar_check_guard_locked(struct colorbar_device *cdev)
 	return 0;
 }
 
+static void colorbar_read_dma_progress_locked(struct colorbar_device *cdev,
+					      const char *phase, u32 *active_addr,
+					      u32 *active_len, u32 *bytes_sent)
+{
+	*active_addr = colorbar_read_cmd32(cdev, COLORBAR_REG_DMA_ACTIVE_ADDR);
+	*active_len = colorbar_read_cmd32(cdev, COLORBAR_REG_DMA_ACTIVE_LEN);
+	*bytes_sent = colorbar_read_cmd32(cdev, COLORBAR_REG_DMA_BYTES_SENT);
+
+	dev_info(&cdev->pdev->dev,
+		 "DMA progress %s: active_addr=0x%08x active_len=%u bytes_sent=%u bytes_sent_hex=0x%08x remaining=%u\n",
+		 phase, *active_addr, *active_len, *bytes_sent, *bytes_sent,
+		 *bytes_sent <= COLORBAR_FRAME_SIZE ? COLORBAR_FRAME_SIZE - *bytes_sent : 0);
+}
+
 static int colorbar_finish_frame_locked(struct colorbar_device *cdev)
 {
 	u32 status;
@@ -421,15 +470,20 @@ static int colorbar_finish_frame_locked(struct colorbar_device *cdev)
 					COLORBAR_STATUS_FRAME_DONE | COLORBAR_STATUS_IDLE,
 					COLORBAR_STATUS_BUSY | COLORBAR_STATUS_STOP_PENDING,
 					frame_wait_ms, true, &status);
-	if (ret)
+	if (ret) {
+		colorbar_read_dma_progress_locked(cdev, "after timeout",
+						      &active_addr, &active_len, &bytes_sent);
 		return ret;
+	}
 
-	if (status & COLORBAR_STATUS_ERROR_MASK)
+	if (status & COLORBAR_STATUS_ERROR_MASK) {
+		colorbar_read_dma_progress_locked(cdev, "after error status",
+						      &active_addr, &active_len, &bytes_sent);
 		return -EIO;
+	}
 
-	active_addr = colorbar_read_cmd32(cdev, COLORBAR_REG_DMA_ACTIVE_ADDR);
-	active_len = colorbar_read_cmd32(cdev, COLORBAR_REG_DMA_ACTIVE_LEN);
-	bytes_sent = colorbar_read_cmd32(cdev, COLORBAR_REG_DMA_BYTES_SENT);
+	colorbar_read_dma_progress_locked(cdev, "after DONE",
+					      &active_addr, &active_len, &bytes_sent);
 
 	dev_info(&cdev->pdev->dev,
 		 "DMA result: active_addr=0x%08x expected_addr=0x%08x active_len=%u bytes_sent=%u\n",
@@ -530,9 +584,9 @@ static int colorbar_start_locked(struct colorbar_device *cdev)
 	cdev->last_buffer_index = 0;
 
 	dev_info(&cdev->pdev->dev,
-		 "started PCIE_DMA_single_1 frame RX, frame_len=%u buffer_size=%u guard=%u addr_byteswap=%d timeout_ms=%u\n",
+		 "started PCIE_DMA_single_1 frame RX, frame_len=%u buffer_size=%u guard=%u cmd_byteswap=%d addr_byteswap=%d readback_byteswap=%d timeout_ms=%u\n",
 		 COLORBAR_FRAME_SIZE, COLORBAR_BUFFER_SIZE, COLORBAR_DMA_GUARD_SIZE,
-		 addr_byteswap, frame_wait_ms);
+		 cmd_byteswap, addr_byteswap, readback_byteswap, frame_wait_ms);
 	return 0;
 }
 
@@ -622,6 +676,18 @@ static long colorbar_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 		colorbar_stop_locked(cdev);
 		mutex_unlock(&cdev->lock);
 		return 0;
+
+	case COLORBAR_IOC_GET_STATUS: {
+		struct colorbar_status_info status;
+
+		mutex_lock(&cdev->lock);
+		colorbar_get_status_snapshot_locked(cdev, &status);
+		mutex_unlock(&cdev->lock);
+
+		if (copy_to_user((void __user *)arg, &status, sizeof(status)))
+			return -EFAULT;
+		return 0;
+	}
 
 	default:
 		return -ENOTTY;
