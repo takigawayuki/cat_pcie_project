@@ -3429,3 +3429,463 @@ FIFO_UNDERFLOW=0
 如果 `IDLE=1` 但 `DONE=0`，通常只是空闲或 STOP 后状态，不代表已经采到一帧。
 
 如果 `IDLE=1` 且 `DONE=1`，但 `FIFO_UNDERFLOW=1`，说明 FPGA 报告了 FIFO 读空错误。当前 Linux/GUI 仍按错误处理，不默认显示这一帧。
+
+## 2026-7-23 GUI 接入 YOLO + LPR 车牌识别
+
+### 1. 本次新增内容
+
+当前 `camara_host_computer/Colorbar_image` 的 GTK 界面已经接入仓库根目录下的三个 RKNN 模型：
+
+```text
+model/best.rknn
+model/lprnet_unified_p7_yolo_crop_adapt_fp.rknn
+model/province_classifier_ft_p8_fp.rknn
+```
+
+推理后端沿用已经存在的板端测试脚本：
+
+```text
+test/infer_rknn_plate.py
+```
+
+这样先复用已经验证过的 YOLO 后处理、车牌裁剪、LPRNet 解码和省份校验逻辑，避免把 Python 逻辑一次性重写成 C 导致新错误。
+
+### 2. 当前 GUI 新按钮
+
+界面工具栏新增：
+
+```text
+加载模型
+识别当前帧
+采集并识别
+```
+
+含义如下：
+
+```text
+加载模型：检查三个 RKNN 模型和推理脚本路径是否存在。
+识别当前帧：对界面里已经采集到的当前帧做车牌定位和识别。
+采集并识别：先从 PCIe DMA 采集一帧，再立即对这一帧做 YOLO + LPR 推理。
+```
+
+右侧状态区域新增 `YOLO + LPR` 信息：
+
+```text
+模型：模型文件检查状态
+车牌：识别到的车牌文本
+车牌/目标：车牌数量 / YOLO 检测目标数量
+推理ms：推理脚本返回的总耗时
+```
+
+### 3. 数据流顺序
+
+`采集并识别` 的顺序是：
+
+```text
+COLORBAR_IOC_START
+→ COLORBAR_IOC_WAIT_FRAME 等 DONE+IDLE
+→ read 4147200 字节 RGB565
+→ RGB565 little-endian 转 RGB888
+→ 保存 /tmp/colorbar_pcie_plate_frame.png
+→ 调用 test/infer_rknn_plate.py
+→ 读取 JSON 输出
+→ 显示车牌文本、目标数量、推理耗时
+→ 如果脚本生成可视化图，界面显示带框结果
+```
+
+也就是说，推理发生在 DMA 完成且 Linux 已经把帧读完之后，不会在 FPGA 正在写 DMA buffer 时读同一块数据。
+
+### 4. 运行命令
+
+先加载 PCIe 驱动：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+sudo rmmod colorbar_pcie_driver 2>/dev/null || true
+./scripts/load_driver.sh allow_dma_start=1
+```
+
+启动界面：
+
+```sh
+sudo ./build/pcie_color_gui
+```
+
+如果 sudo 打不开图形窗口：
+
+```sh
+xhost +local:root
+sudo ./build/pcie_color_gui
+```
+
+界面操作顺序：
+
+```text
+1. 点击“连接设备”。
+2. 点击“加载模型”，确认右侧模型状态为 ready。
+3. 点击“采集并识别”。
+4. 查看右侧“车牌”“车牌/目标”“推理ms”。
+5. 如果已经采过一帧，也可以直接点“识别当前帧”。
+```
+
+### 5. 路径和环境变量
+
+默认工程根目录写死为：
+
+```text
+/home/cat/cat_pcie_project
+```
+
+如果以后工程移动位置，可以用环境变量覆盖：
+
+```sh
+sudo COLORBAR_PROJECT_ROOT=/home/cat/cat_pcie_project ./build/pcie_color_gui
+```
+
+推理中间文件位置：
+
+```text
+/tmp/colorbar_pcie_plate_frame.png
+/tmp/colorbar_pcie_plate_infer/
+```
+
+可视化输出默认会从这里加载：
+
+```text
+/tmp/colorbar_pcie_plate_infer/colorbar_pcie_plate_frame_vis.jpg
+```
+
+### 6. 当前限制
+
+当前版本为了稳妥，GUI 是通过子进程调用 Python 脚本完成推理。也就是每次点击识别时，Python 脚本会加载 RKNN 模型并运行一次推理。
+
+这适合先验证完整链路：
+
+```text
+FPGA PCIe 图像 → Linux GUI → YOLO 定位 → LPR 识别
+```
+
+如果后续要做更高帧率连续识别，建议下一步优化为：
+
+```text
+Python 推理服务常驻内存
+或 C++/RKNN API 直接集成
+```
+
+这样可以避免每帧重复加载模型。
+
+## 2026-7-23 GUI 模型按钮与识别结果显示修正
+
+### 1. 修正的问题
+
+之前在连续采集时，界面每采完一帧都会短暂恢复按钮状态，然后马上进入下一帧采集，所以工具栏按钮会看起来闪烁。同时 `加载模型` 按钮会被采集状态禁用，导致连续采集过程中无法检查模型状态。
+
+现在已调整为：
+
+```text
+连续采集期间：采集相关按钮保持稳定禁用，只保留“停止”和“加载模型”可用。
+加载模型：只做模型/脚本路径检查，不访问 DMA buffer，因此允许在连续采集期间点击。
+识别当前帧/采集并识别：仍然要求不在连续采集状态，避免推理读取正在变化的显示帧。
+```
+
+### 2. 识别结果显示增强
+
+界面顶部新增醒目的结果横条：
+
+```text
+车牌识别：xxx
+```
+
+推理状态会显示为：
+
+```text
+车牌识别：运行中...
+车牌识别：未识别到有效车牌
+车牌识别：识别失败
+车牌识别：实际车牌字符
+```
+
+右侧 `YOLO + LPR` 表格仍然保留：
+
+```text
+模型
+车牌
+车牌/目标
+推理ms
+```
+
+### 3. 定位框显示判断
+
+推理完成后，GUI 会尝试加载：
+
+```text
+/tmp/colorbar_pcie_plate_infer/colorbar_pcie_plate_frame_vis.jpg
+```
+
+如果加载成功，日志会出现：
+
+```text
+visualization loaded: /tmp/colorbar_pcie_plate_infer/colorbar_pcie_plate_frame_vis.jpg
+```
+
+如果没有出现定位框，要看右侧日志：
+
+```text
+visualization not found: /tmp/colorbar_pcie_plate_infer/colorbar_pcie_plate_frame_vis.jpg
+load visualization failed: ...
+inference failed: ...
+inference ok: plates=0 detections=0 result=no valid plate ...
+```
+
+含义：
+
+```text
+visualization loaded：结果图已经加载，如果没有框，说明模型没有检测到目标或可视化图本身无框。
+visualization not found：推理脚本没有生成结果图，优先检查 Python 推理脚本输出和依赖。
+inference failed：推理脚本运行失败，看 stderr 信息。
+plates=0 detections=0：模型跑了，但没有检测到车牌/目标。
+```
+
+### 4. 推荐操作顺序
+
+不要先点连续采集再做模型识别验证。第一次验证模型链路建议这样：
+
+```text
+连接设备
+→ 加载模型
+→ 采集并识别
+```
+
+确认能看到车牌字符和定位框后，再使用普通连续采集观察 PCIe 画面流。
+
+## 2026-7-23 YOLO/LPR 不显示定位框和字符的原因修正
+
+### 1. 实际原因
+
+GUI 之前调用的是系统默认：
+
+```text
+/usr/bin/python3
+```
+
+但当前系统 Python 不能导入推理依赖：
+
+```text
+cv2 fail
+numpy fail
+rknnlite fail
+```
+
+所以点击识别时，YOLO/LPR 推理脚本没有真正完成，自然不会显示定位框和车牌字符。
+
+板端可用的 conda 环境是：
+
+```text
+/home/cat/miniconda3/envs/fenqusai/bin/python
+```
+
+该环境已经确认可以导入：
+
+```text
+cv2
+numpy
+rknnlite
+```
+
+### 2. GUI 当前修正
+
+GUI 默认推理 Python 已改为：
+
+```text
+/home/cat/miniconda3/envs/fenqusai/bin/python
+```
+
+启动界面后，日志会显示：
+
+```text
+inference python: /home/cat/miniconda3/envs/fenqusai/bin/python
+```
+
+点击“加载模型”成功时，日志会显示：
+
+```text
+models ready: YOLO + LPRNet + province verifier, python=/home/cat/miniconda3/envs/fenqusai/bin/python
+```
+
+### 3. 如果以后要换 Python 环境
+
+可以用环境变量覆盖：
+
+```sh
+sudo COLORBAR_INFER_PYTHON=/home/cat/miniconda3/envs/fenqusai/bin/python ./build/pcie_color_gui
+```
+
+### 4. 当前推荐重新测试步骤
+
+需要关闭旧 GUI，重新打开新编译的 GUI：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+./scripts/load_driver.sh allow_dma_start=1
+sudo ./build/pcie_color_gui
+```
+
+界面操作：
+
+```text
+连接设备
+→ 加载模型
+→ 采集并识别
+```
+
+如果仍然没有框，重点看右侧日志：
+
+```text
+inference failed: ...
+visualization loaded: ...
+visualization not found: ...
+inference ok: plates=0 detections=0 ...
+```
+
+其中：
+
+```text
+visualization loaded 但没框：模型跑完了，但没有检测目标。
+inference failed：推理脚本运行失败，日志里会带 stderr。
+plates=0 detections=0：模型正常跑，但当前图像未检测到车牌/目标。
+```
+
+
+## 2026-7-23 GUI 推理环境修正为 fenqusai
+
+### 1. 本次日志暴露的问题
+
+右侧 GUI 日志文件：
+
+```sh
+/tmp/colorbar_pcie_gui.log
+```
+
+之前失败信息是：
+
+```text
+RuntimeError: rknnlite import failed: No module named 'ruamel'
+```
+
+这说明当时 GUI 调用的 Python 环境里缺少 RKNN Lite 运行所需依赖，不是 PCIe DMA、FPGA 图像传输、YOLO 模型文件本身先出问题。
+
+### 2. 当前修正
+
+GUI 默认推理 Python 已改为当前可正常推理的环境：
+
+```text
+/home/cat/miniconda3/envs/fenqusai/bin/python
+```
+
+并且“加载模型”现在会额外检查这些依赖是否能导入：
+
+```text
+cv2
+numpy
+rknnlite.api
+ruamel.yaml
+```
+
+如果依赖缺失，右侧日志会直接显示：
+
+```text
+inference deps missing: ...
+```
+
+这样不会再出现“模型 ready，但真正识别才发现 Python 缺包”的误判。
+
+### 3. 已验证
+
+普通用户和 sudo 下均验证通过：
+
+```sh
+/home/cat/miniconda3/envs/fenqusai/bin/python -c "import cv2, numpy, rknnlite.api, ruamel.yaml"
+sudo /home/cat/miniconda3/envs/fenqusai/bin/python -c "import cv2, numpy, rknnlite.api, ruamel.yaml"
+```
+
+GUI 已重新编译通过：
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+make gui
+```
+
+### 4. 当前推荐运行步骤
+
+```sh
+cd /home/cat/cat_pcie_project/camara_host_computer/Colorbar_image
+./scripts/load_driver.sh allow_dma_start=1
+sudo ./build/pcie_color_gui
+```
+
+界面操作顺序：
+
+```text
+连接设备
+→ 加载模型
+→ 采集并识别
+```
+
+如果要连续看视频，先用“连续采集”；要识别时先点“停止”，再点“识别当前帧”或“采集并识别”。当前设计故意不在连续采集线程里同时跑模型，避免 GUI 卡顿和读取同一帧 buffer 时产生竞争。
+
+## 2026-7-23 YOLO/LPR 手动推理验证结果
+
+### 1. 验证命令
+
+使用 GUI 同一套默认环境和同一张临时输入图手动运行：
+
+```sh
+cd /home/cat/cat_pcie_project
+sudo /home/cat/miniconda3/envs/fenqusai/bin/python test/infer_rknn_plate.py \
+  --image /tmp/colorbar_pcie_plate_frame.png \
+  --yolo-model model/best.rknn \
+  --lpr-model model/lprnet_unified_p7_yolo_crop_adapt_fp.rknn \
+  --province-model model/province_classifier_ft_p8_fp.rknn \
+  --output-dir /tmp/colorbar_pcie_plate_infer \
+  --save-vis \
+  --no-export-debug
+```
+
+### 2. 当前结果
+
+推理脚本已经能正常跑通，并检测到 2 个车牌目标：
+
+```text
+粤K70399
+赣0DRPPP
+```
+
+同时已经生成 GUI 要加载的可视化图片：
+
+```text
+/tmp/colorbar_pcie_plate_infer/colorbar_pcie_plate_frame_vis.jpg
+```
+
+该图片是：
+
+```text
+1920x1080 JPEG
+```
+
+所以如果重新启动新编译 GUI 后仍看不到框，优先确认右侧日志是否出现：
+
+```text
+visualization loaded: /tmp/colorbar_pcie_plate_infer/colorbar_pcie_plate_frame_vis.jpg
+```
+
+如果出现这行但画面还是没框，才继续查 GUI 显示刷新；如果没有出现这行，则继续看 `inference failed` 或 `visualization not found` 后面的具体错误。
+
+### 3. RKNN 警告说明
+
+运行时出现的：
+
+```text
+Query dynamic range failed. Ret code: RKNN_ERR_MODEL_INVALID
+```
+
+当前可先按静态 shape RKNN 模型警告处理，不是本次无框/无字符的根因。脚本仍然返回了 JSON、检测框、车牌字符和可视化图片。
